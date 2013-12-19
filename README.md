@@ -13,9 +13,12 @@ You may obtain a copy of the License at
 
 Overview
 =========
-The OpenStack project is an open source cloud computing platform to meet the needs of public and private            clouds. Cinder is the Block Storage module of OpenStack which enables management of volumes, volume                 snapshots, and volume types.
+The OpenStack project is an open source cloud computing platform to meet the needs of public and private
+clouds. Cinder is the Block Storage module of OpenStack which enables management of volumes, 
+volume snapshots, and volume types.
 
-EMC VNX CLI Cinder driver is based on the ISCSIDriver defined in Cinder, with the ability to create/delete,attach/detach volumes,create/delete snapshots, etc. This Cinder driver executes
+EMC VNX CLI Cinder driver is based on the ISCSIDriver defined in Cinder, with the ability to 
+create/delete,attach/detach volumes,create/delete snapshots, etc. This Cinder driver executes
 the volume operations by communicating with the backend EMC storage through NaviSec CLI.
 
 
@@ -25,6 +28,7 @@ Requirements
 OpenStack Release
 -----------------
 Havana
+
 Grizzly
 
 Supported VNX arrays
@@ -78,6 +82,7 @@ Install NaviSec CLI
 NaviSec CLI tool needs to be installed in Controller node and all the Cinder nodes in an OpenStack Deployment.
 
 For Ubuntu x64 platform, use the custom installation package naviseccli.tgz as follows:
+
 	* Change directory to naviseccli-files and execute install.sh file.
 	* cd naviseccli-files/
 	* sh install.sh
@@ -103,13 +108,20 @@ the cinder-volume service(Cinder nodes) must be registered with the VNX.
 Below mentioned steps are for a Compute node.Please follow the same steps for Cinder nodes also.
 
 On the Compute node 1.1.1.1, do the following (assume 10.10.61.35 is the iscsi target):
+
 $ sudo /etc/init.d/open-iscsi start
+
 $ sudo iscsiadm -m discovery -t st -p 10.10.61.35
+
 $ cd /etc/iscsi
+
 $ sudo more initiatorname.iscsi
+
 $ iscsiadm -m node
 
+
 Log in to VNX from the Compute node using the target corresponding to the SPA port:
+
 * $ sudo iscsiadm -m node -T iqn.1992-04.com.emc:cx.apm01234567890.a0 -p 10.10.61.35 -l
 * Assume "iqn.1993-08.org.debian:01:1a2b3c4d5f6g" is the initiator name of the Compute node. 
 * Login to Unisphere, go to VNX00000->Hosts->Initiators,
@@ -120,14 +132,17 @@ Log in to VNX from the Compute node using the target corresponding to the SPA po
 * Click Register. Now host 1.1.1.1 will appear under Hosts->Host List as well.
 
 Log out of VNX on the Compute node:
+
 * $ sudo iscsiadm -m node -u
 
 Log in to VNX from the Compute node using the target corresponding to the SPB port:
+
 * $ sudo iscsiadm -m node -T iqn.1992-04.com.emc:cx.apm01234567890.b8 -p 10.10.10.11 -l
 
 In Unisphere register the initiator with the SPB port.
 
 Log out:
+
 * $ sudo iscsiadm -m node -u
 
 Setup
@@ -136,21 +151,33 @@ Normal configuration
 -----------------------
 Make the following changes in /etc/cinder/cinder.conf:
 
-Following are the elements specific to VNX CLI driver to be configured 
+Following are the elements specific to VNX CLI driver to be configured
 
 iscsi_pool_id = 1
+
 iscsi_ip_address = 10.10.61.35
+
 storage_vnx_ip_address = 10.10.72.41
+
 storage_vnx_username = username
+
 storage_vnx_password = password
+
 naviseccli_path = /opt/Navisphere/bin/naviseccli
-#Timeout in Minutes
+
+(Timeout in Minutes)
+
 default_timeout = 10
+
 volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
 
+
 [database]
+
 max_pool_size=20
+
 max_overflow=30
+
 
 * where 10.10.61.35 is the IP address of the VNX iSCSI target and 10.10.72.41 is 
         the IP address of the VNX array.
@@ -161,30 +188,53 @@ Multi-backend configuration (from the same host)
 enabled_backends=driverA, driverB
 
 [driverA]
+
 iscsi_pool_id = 1
+
 iscsi_ip_address = 10.10.61.35
+
 storage_vnx_ip_address = 10.10.72.41
+
 storage_vnx_username = username
+
 storage_vnx_password = password
+
 naviseccli_path = /opt/Navisphere/bin/naviseccli
-#Timeout in Minutes
+
+(Timeout in Minutes)
+
 default_timeout = 10
+
 volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
+
 
 [driverB]
+
 iscsi_pool_id = 1
+
 iscsi_ip_address = 10.10.101.40
+
 storage_vnx_ip_address = 10.10.26.101
+
 storage_vnx_username = username
+
 storage_vnx_password = password
+
 naviseccli_path = /opt/Navisphere/bin/naviseccli
-#Timeout in Minutes
+
+(Timeout in Minutes)
+
 default_timeout = 10
+
 volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
 
+
 [database]
+
 max_pool_size=20
+
 max_overflow=30
+
 
 * Restart the cinder-volume service after configuring the above options.
 
