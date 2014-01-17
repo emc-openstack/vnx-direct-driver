@@ -313,7 +313,7 @@ class EMCVnxCli():
 
         #defining CLI command
         command_to_execute = (_("%(navisecclicmd)s lun -create -type Snap "
-        "-primaryLunName %(sourcelun)s -sp A -name %(volumename)s") 
+        "-primaryLunName %(sourcelun)s -name %(volumename)s") 
              % {'navisecclicmd':self.navisecclicmd,
                 'sourcelun':source_volume_name,
                 'volumename':volumename})
@@ -368,7 +368,7 @@ class EMCVnxCli():
 
         #defining CLI command
         command_to_execute = (_("%(navisecclicmd)s lun -create -capacity "
-        "%(volumesize)s -sq gb -poolId %(poolid)s -sp A -name "
+        "%(volumesize)s -sq gb -poolId %(poolid)s -name "
         "%(tempvolumename)s") 
                 % {'navisecclicmd':self.navisecclicmd,
                    'poolid':self.pool_id,
