@@ -87,8 +87,17 @@ For Ubuntu x64 platform, use the custom installation package naviseccli.tgz as f
 	* cd naviseccli-files/
 	* sh install.sh
 
-For all the other variants of Linux, download the NaviSec CLI installer from EMC's Website at following location:
+For all the other variants of Linux, download the NaviSecCLI installer from EMC's Website at following location:
 https://support.emc.com/downloads/5890_Navisphere-Agents-CLI---Linux
+
+	Instructions to install the NaviSecCli RPM package on Ubuntu
+	------------------------------------------------------------
+	1. Create directory /opt/Navisphere/bin/
+		mkdir –f /opt/Navisphere/bin/
+	2. Copy the RPM package in the above created directory.
+	3. cd /opt/Navisphere/bin/
+	4. sudo apt-get install alien –y
+	5. sudo alien -i NaviCLI-Linux-64-x86-en_US-7.xx.xx.x.xx.x86_64.rpm
 
 Install Cinder driver
 -----------------------
