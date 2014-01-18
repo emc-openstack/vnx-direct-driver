@@ -81,16 +81,11 @@ Install NaviSec CLI
 -------------------
 NaviSec CLI tool needs to be installed in Controller node and all the Cinder nodes in an OpenStack Deployment.
 
-For Ubuntu x64 platform, use the custom installation package naviseccli.tgz as follows:
 
-	* Change directory to naviseccli-files and execute install.sh file.
-	* cd naviseccli-files/
-	* sh install.sh
-
-For all the other variants of Linux, download the NaviSecCLI installer from EMC's Website at following location:
+Download the NaviSecCLI installer from EMC's Website at following location:
 https://support.emc.com/downloads/5890_Navisphere-Agents-CLI---Linux
 
-	Instructions to install the NaviSecCli RPM package on Ubuntu
+	For Ubuntu x64, use these custom installation instructions: 
 	------------------------------------------------------------
 	1. Create directory /opt/Navisphere/bin/
 		mkdir –f /opt/Navisphere/bin/
@@ -98,6 +93,9 @@ https://support.emc.com/downloads/5890_Navisphere-Agents-CLI---Linux
 	3. cd /opt/Navisphere/bin/
 	4. sudo apt-get install alien –y
 	5. sudo alien -i NaviCLI-Linux-64-x86-en_US-7.xx.xx.x.xx.x86_64.rpm
+
+For all the other variants of Linux, install the rpm as usual.
+	
 
 Install Cinder driver
 -----------------------
