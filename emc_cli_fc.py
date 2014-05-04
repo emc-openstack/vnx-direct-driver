@@ -11,7 +11,7 @@
 #
 
 """
-ISCSI Drivers for EMC VNX array based on CLI.
+Fibre Channel Driver for EMC VNX array based on CLI.
 
 """
 
@@ -22,21 +22,27 @@ from cinder.volume.drivers.emc import emc_vnx_cli
 LOG = logging.getLogger(__name__)
 
 
-class EMCCLIISCSIDriver(driver.ISCSIDriver):
-    """EMC ISCSI Drivers for VNX using CLI."""
+class EMCCLIFCDriver(driver.FibreChannelDriver):
+    """EMC FC Driver for VNX using CLI.
+
+    Version history:
+        1.0.0 - Initial driver
+    """
+
+    VERSION = "1.0.0"
 
     def __init__(self, *args, **kwargs):
 
-        super(EMCCLIISCSIDriver, self).__init__(*args, **kwargs)
+        super(EMCCLIFCDriver, self).__init__(*args, **kwargs)
         self.cli = emc_vnx_cli.getEMCVnxCli(
-            'iSCSI',
+            'FC',
             configuration=self.configuration)
 
     def check_for_setup_error(self):
         pass
 
     def create_volume(self, volume):
-        """Creates a EMC(VMAX/VNX) volume."""
+        """Creates a volume."""
         self.cli.create_volume(volume)
 
     def create_volume_from_snapshot(self, volume, snapshot):
@@ -52,10 +58,11 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
         self.cli.extend_volume(volume, new_size)
 
     def delete_volume(self, volume):
-        """Deletes an EMC volume."""
+        """Deletes a volume."""
         self.cli.delete_volume(volume)
 
     def migrate_volume(self, ctxt, volume, host):
+        """Migrate volume via EMC migration functionality."""
         return self.cli.migrate_volume(ctxt, volume, host)
 
     def create_snapshot(self, snapshot):
@@ -72,7 +79,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
 
     def create_export(self, context, volume):
         """Driver entry point to get the export info for a new volume."""
-        self.cli.create_export(context, volume)
+        pass
 
     def remove_export(self, context, volume):
         """Driver entry point to remove an export for a volume."""
@@ -85,45 +92,69 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
     def initialize_connection(self, volume, connector):
         """Initializes the connection and returns connection info.
 
-        The iscsi driver returns a driver_volume_type of 'iscsi'.
-        the format of the driver data is defined in _get_iscsi_properties.
-        Example return value::
+        Assign any created volume to a compute node/host so that it can be
+        used from that host.
+
+        The  driver returns a driver_volume_type of 'fibre_channel'.
+        The target_wwn can be a single entry or a list of wwns that
+        correspond to the list of remote wwn(s) that will export the volume.
+        Example return values:
 
             {
-                'driver_volume_type': 'iscsi'
+                'driver_volume_type': 'fibre_channel'
                 'data': {
                     'target_discovered': True,
-                    'target_iqn': 'iqn.2010-10.org.openstack:volume-00000001',
-                    'target_portal': '127.0.0.0.1:3260',
-                    'volume_id': 1,
+                    'target_lun': 1,
+                    'target_wwn': '1234567890123',
+                }
+            }
+
+            or
+
+             {
+                'driver_volume_type': 'fibre_channel'
+                'data': {
+                    'target_discovered': True,
+                    'target_lun': 1,
+                    'target_wwn': ['1234567890123', '0987654321321'],
                 }
             }
 
         """
-        return self.cli.initialize_connection(volume, connector)
+        device_number = self.cli.initialize_connection(volume,
+                                                       connector)
+        ports = self.cli.get_target_wwns(connector)
+
+        data = {'driver_volume_type': 'fibre_channel',
+                'data': {'target_lun': device_number,
+                         'target_discovered': True,
+                         'target_wwn': ports}}
+
+        LOG.debug(_('Return FC data: %(data)s.')
+                  % {'data': data})
+
+        return data
 
     def terminate_connection(self, volume, connector, **kwargs):
         """Disallow connection from connector."""
         self.cli.terminate_connection(volume, connector)
 
     def get_volume_stats(self, refresh=False):
-        """Get volume status.
+        """Get volume stats.
 
         If 'refresh' is True, run update the stats first.
         """
         if refresh:
-            self.update_volume_status()
+            self.update_volume_stats()
 
         return self._stats
 
-    def update_volume_status(self):
-        """Retrieve status info from volume group."""
-        LOG.debug(_("Updating volume status"))
-        #retrieving the volume update from the VNX
+    def update_volume_stats(self):
+        """Retrieve stats info from volume group."""
+        LOG.debug(_("Updating volume stats"))
         data = self.cli.update_volume_status()
-
         backend_name = self.configuration.safe_get('volume_backend_name')
-        data['volume_backend_name'] = backend_name or 'EMCCLIISCSIDriver'
-        data['storage_protocol'] = 'iSCSI'
-
+        data['volume_backend_name'] = backend_name or 'EMCCLIFCDriver'
+        data['storage_protocol'] = 'FC'
+        data['driver_version'] = self.VERSION
         self._stats = data
