@@ -165,14 +165,14 @@ Alternatively, if all cinder backends with VNX Direct Driver deployed on the sam
 2. Switch to root account
 
         $ sudo su
-2. Change `cinder:x:113:120::/var/lib/cinder:/bin/false` to `cinder:x:113:120::/var/lib/cinder:/bin/bash` in `/etc/passwd` 
-    (This temporary change is to make step 3 work.)
-3. Save the credentials on behave of `cinder` user (assuming the array credentials are `admin/admin` in `global` scope)
+3. Change `cinder:x:113:120::/var/lib/cinder:/bin/false` to `cinder:x:113:120::/var/lib/cinder:/bin/bash` in `/etc/passwd` 
+    (This temporary change is to make step 4 work.)
+4. Save the credentials on behave of `cinder` user (assuming the array credentials are `admin/admin` in `global` scope)
 
         $ su -l cinder -c '/opt/Navisphere/bin/naviseccli -AddUserSecurity -user admin -password admin -scope 0'`
-4.	Change `cinder:x:113:120::/var/lib/cinder:/bin/bash` back to `cinder:x:113:120::/var/lib/cinder:/bin/false` in /etc/passwd
-5.	Remove the credentials from `/etc/cinder/cinder.conf`
-6.	Restart cinder-volume service to make the change take effect
+5.	Change `cinder:x:113:120::/var/lib/cinder:/bin/bash` back to `cinder:x:113:120::/var/lib/cinder:/bin/false` in /etc/passwd
+6.	Remove the credentials from `/etc/cinder/cinder.conf`
+7.	Restart cinder-volume service to make the change take effect
 
 ## Thick/Thin Provisioning
 
