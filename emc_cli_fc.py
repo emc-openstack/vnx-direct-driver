@@ -23,13 +23,7 @@ LOG = logging.getLogger(__name__)
 
 
 class EMCCLIFCDriver(driver.FibreChannelDriver):
-    """EMC FC Driver for VNX using CLI.
-
-    Version history:
-        1.0.0 - Initial driver
-    """
-
-    VERSION = "1.0.0"
+    """EMC FC Driver for VNX using CLI."""
 
     def __init__(self, *args, **kwargs):
 
@@ -156,5 +150,4 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
         backend_name = self.configuration.safe_get('volume_backend_name')
         data['volume_backend_name'] = backend_name or 'EMCCLIFCDriver'
         data['storage_protocol'] = 'FC'
-        data['driver_version'] = self.VERSION
         self._stats = data
