@@ -7,8 +7,8 @@ Licensed under EMC Freeware Software License Agreement
 You may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-        https://github.com/emc-openstack/freeware-eula/
-        blob/master/Freeware_EULA_20131217_modified.md
+    https://github.com/emc-openstack/freeware-eula/
+    blob/master/Freeware_EULA_20131217_modified.md
 
 ## Overview
 
@@ -31,7 +31,7 @@ This driver supports Icehouse and newer release. Compared to version in the offi
 
 ## Requirements
 
-* Flare version 5.32 or higher.
+* VNX OE for Block version 5.32 or higher.
 * VNX Snapshot and Thin Provisioning license should be activated for VNX.
 * Navisphere CLI v7.32 or higher is installed along with the driver
 
@@ -59,7 +59,7 @@ The following operations will be supported on VNX array:
 Navisphere CLI needs to be installed in all the Cinder nodes in an OpenStack deployment.
 
 * For Ubuntu x64, DEB is available in [EMC OpenStack Github](https://github.com/emc-openstack/naviseccli).
-* For all other variants of Linux, Navisphere CLI is available at [EMC Support](https://support.emc.com/downloads/5890_Navisphere-Agents-CLI---Linux).
+* For all other variants of Linux, Navisphere CLI is available at [Downloads for VNX2 Series](https://support.emc.com/downloads/36656_VNX2-Series) or [Downloads for VNX1 Series](https://support.emc.com/downloads/12781_VNX1-Series).
 
 
 ### Install Cinder driver
