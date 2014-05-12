@@ -1,4 +1,4 @@
-# VNX Direct Driver for Icehouse
+# VNX Direct Driver
 
 Copyright (c) 2012 - 2014 EMC Corporation
 All Rights Reserved
