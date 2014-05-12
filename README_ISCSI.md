@@ -20,7 +20,7 @@ The Navisphere CLI (a.k.a. NaviSecCLI) is a Command Line Interface (CLI) used fo
 
 ## Supported OpenStack Release
 
-This driver supports Havana and newer release. Compared to version in the official OpenStack Github master branch, here are the enhancements:
+This driver supports Havana and Icehouse releases. Compared to version in the official OpenStack Github master branch, here are the enhancements:
 
 * Multiple Pools Support
 * Connectivity Check for iSCSI Portal Selection
