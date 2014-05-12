@@ -1,4 +1,4 @@
-# VNX FC Direct Driver for Icehouse
+# VNX FC Direct Driver
 
 Copyright (c) 2012 - 2014 EMC Corporation
 All Rights Reserved
@@ -20,7 +20,7 @@ The Navisphere CLI (a.k.a. NaviSecCLI) is a Command Line Interface (CLI) used fo
 
 ## Supported OpenStack Release
 
-This driver supports Icehouse and newer release. Compared to version in the official OpenStack Github master branch, here are the enhancements:
+This driver supports Havana and newer release. Compared to version in the official OpenStack Github master branch, here are the enhancements:
 
 * Multiple Pools Support
 * Initiator Auto Registration
