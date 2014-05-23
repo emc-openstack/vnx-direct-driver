@@ -38,7 +38,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.00'
+VERSION = '03.00.01'
 
 LOG = logging.getLogger(__name__)
 
@@ -57,6 +57,10 @@ loc_opts = [
     cfg.StrOpt('storage_vnx_authentication_type',
                default='global',
                help='VNX authentication scope type'),
+    cfg.StrOpt('storage_vnx_security_file_dir',
+               default=None,
+               help='Directory path that contains the VNX security file.'
+                    ' Make sure the security file is generated first'),
     cfg.StrOpt('naviseccli_path',
                default='',
                help='Naviseccli Path'),
@@ -183,17 +187,30 @@ class CommandLineHelper(object):
         storage_username = configuration.san_login
         storage_password = configuration.san_password
         storage_auth_type = configuration.storage_vnx_authentication_type
+        storage_vnx_security_file = configuration.storage_vnx_security_file_dir
 
         if storage_auth_type is None:
             storage_auth_type = 'global'
         elif storage_auth_type.lower() not in ('ldap', 'local', 'global'):
             errormessage += (_('Invalid VNX authentication type!\n'))
+        #if there is security file path provided, use this security file
+        if storage_vnx_security_file:
+            self.credentials = ('-secfilepath', storage_vnx_security_file)
+            LOG.info("Security file under location configured by "
+                     "storage_vnx_security_file_dir is using for"
+                     " authentication")
         #if there is a username/password provided, use those in the cmd line
-        if storage_username is not None and \
-                storage_password is not None:
+        elif storage_username is not None and len(storage_username) > 0 and\
+                storage_password is not None and len(storage_password) > 0:
             self.credentials = ('-user', storage_username,
                                 '-password', storage_password,
                                 '-scope', storage_auth_type)
+            LOG.info("Plain text credentials are using for authentication")
+        else:
+            LOG.info("Neither storage_vnx_security_file_dir nor plain text"
+                     " credentials is specified, security file under home"
+                     " directory will be used if present")
+
         self.iscsi_initiator_map = None
         if configuration.iscsi_initiators:
             self.iscsi_initiator_map = \

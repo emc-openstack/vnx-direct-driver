@@ -125,9 +125,15 @@ Following are the elements specific to VNX CLI driver to be configured
         storage_vnx_pool_name = Pool_01_SAS
         san_ip = 10.10.72.41
         san_secondary_ip = 10.10.72.42
-        san_login = username
-        san_password = password
-        storage_vnx_authentication_type = global
+        #VNX user name
+        #san_login = username
+        #VNX user password
+        #san_password = password
+        #VNX user type. Valid values are: global, local and ldap. global is the default value
+        #storage_vnx_authentication_type = ldap
+        #Directory path that contains the VNX security file. Make sure the security file is generated first
+        #VNX credentials are not needed to configured with using security file
+        storage_vnx_security_file_dir = /etc/secfile/array1
         naviseccli_path = /opt/Navisphere/bin/naviseccli
         # timeout in minutes
         default_timeout = 10
@@ -143,14 +149,35 @@ Following are the elements specific to VNX CLI driver to be configured
 
 * where `san_ip` is one of the SP IP address of the VNX array. `san_secondary_ip` is the other SP IP address of VNX array. `san_secondary_ip` is an optional field, it serve the purpose of providing a high availability(HA) design. Based on that if one of the SP is down, the other SP can be connected automatically. `san_ip` is a mandatory field, which provide the main connection.
 * where `Pool_01_SAS` is the pool user wants to create volume from. The pools can be created using Unisphere for VNX. Refer to the following "Multiple Pools and Thick/Thin Provisioning" section on how to support thick/thin provisioning
+* where `storage_vnx_security_file_dir` is directory path that contains the VNX security file. Make sure the security file is generated according to the steps in Authentication section if use it
 * where `iscsi_initiators` is a dicstionary of IP addressess iSCSI initiator ports of all OpenStack nodes that want to VNX Block Storage via iSCSI. If this option is configured, the driver will leverage this information to find a accessible iSCSI target portal for the initiator when attaching volumes. Otherwise, the iSCSI target portal will be chosen in a relative random way.
 * Restart of cinder-volume service is needed to make the configuration change take effect.
 
 ## Authentication
 
-VNX credentials are needed so that the driver could talk with the VNX system. Credentials in Global, Local and LDAP scopes are supported. 
+VNX credentials are needed so that the driver could talk with the VNX system. Credentials in Global, Local and LDAP scopes are supported. There are 2 approaches to provide the credentials:
 
-The credentials can be specified in /etc/cinder/cinder.conf by below 3 options:
+The recommended one is using Navisphere CLI security file to provide credentials which can get rid of providing plain text credentials in configuration file. Below is instruction on how to do this.
+
+1. Find out the Linux User ID of the `/usr/bin/cinder-volume` processes. Assuming the service /usr/bin/cinder-volume is running with account `cinder`
+2. Switch to root account
+
+       $ sudo su
+3. Change `cinder:x:113:120::/var/lib/cinder:/bin/false` to `cinder:x:113:120::/var/lib/cinder:/bin/bash` in `/etc/passwd` 
+    (This temporary change is to make step 4 work.)
+4. Save the credentials on behave of `cinder` user to security file(assuming the array credentials are `admin/admin` in `global` scope). In below command, swith -secfilepath is used to specify where to save security file (assume saving to directory /etc/secfile/array1).
+
+        $ su -l cinder -c '/opt/Navisphere/bin/naviseccli -AddUserSecurity -user admin -password admin -scope 0 -secfilepath /etc/secfile/array1'
+   Save security file to different locations for different arrays except same credentials are shared between all arrays managed by the host. Otherwise, the credentials in security file will be overwritten. If `-secfilepath` is not specified in above command, the security file will be saved to default location which is home directory of executor. 
+5. Change `cinder:x:113:120::/var/lib/cinder:/bin/bash` back to `cinder:x:113:120::/var/lib/cinder:/bin/false` in /etc/passwd
+6. Remove the credentials options `san_login`, `san_password` and `storage_vnx_authentication_type` from cinder.conf (normally it is `/etc/cinder/cinder.conf`). 
+   Add option `storage_vnx_security_file_dir` and set its value to the directory path supplied with switch '-secfilepath' in step 4. Omit this option if '-secfilepath' is not used in step 4.
+
+        #Directory path that contains the VNX security file. Generate the security file first
+        storage_vnx_security_file_dir = /etc/secfile/array1
+7. Restart cinder-volume service to make the change take effect
+
+Alternatively, the credentials can be specified in /etc/cinder/cinder.conf by below 3 options with plain text:
 
         #VNX user name
         san_login = username
@@ -158,21 +185,6 @@ The credentials can be specified in /etc/cinder/cinder.conf by below 3 options:
         san_password = password
         #VNX user type. Valid values are: global, local and ldap. global is the default value
         storage_vnx_authentication_type = ldap
-
-Alternatively, if all cinder backends with VNX Direct Driver deployed on the same Cinder node share the same credentials to access arrays, credentials can also be provided by the standard Navisphere CLI security file as follows.
-
-1. Find out the Linux User ID of the `/usr/bin/cinder-volume` processes. Assuming the service /usr/bin/cinder-volume is running with account `cinder`
-2. Switch to root account
-
-        $ sudo su
-3. Change `cinder:x:113:120::/var/lib/cinder:/bin/false` to `cinder:x:113:120::/var/lib/cinder:/bin/bash` in `/etc/passwd` 
-    (This temporary change is to make step 4 work.)
-4. Save the credentials on behave of `cinder` user (assuming the array credentials are `admin/admin` in `global` scope)
-
-        $ su -l cinder -c '/opt/Navisphere/bin/naviseccli -AddUserSecurity -user admin -password admin -scope 0'`
-5.	Change `cinder:x:113:120::/var/lib/cinder:/bin/bash` back to `cinder:x:113:120::/var/lib/cinder:/bin/false` in /etc/passwd
-6.	Remove the credentials from `/etc/cinder/cinder.conf`
-7.	Restart cinder-volume service to make the change take effect
 
 ## Thick/Thin Provisioning
 
@@ -199,8 +211,8 @@ When `storage_vnx_pool_name` is not given in the configuration file, driver will
 Here is an example of configuration of array-based backend.
 
         san_ip = 10.10.72.41
-        san_login = username
-        san_password = password
+        #Directory path that contains the VNX security file. Make sure the security file is generated first
+        storage_vnx_security_file_dir = /etc/secfile/array1
         storage_vnx_authentication_type = global
         naviseccli_path = /opt/Navisphere/bin/naviseccli
         default_timeout = 10
@@ -242,8 +254,8 @@ In following scenarios, VNX native LUN migration will not be triggered:
 
         storage_vnx_pool_name = Pool_01_SAS
         san_ip = 10.10.72.41
-        san_login = username
-        san_password = password
+        #Directory path that contains the VNX security file. Make sure the security file is generated first
+        storage_vnx_security_file_dir = /etc/secfile/array1
         naviseccli_path = /opt/Navisphere/bin/naviseccli
         # Timeout in Minutes
         default_timeout = 10
