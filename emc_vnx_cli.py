@@ -1,24 +1,26 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#    Copyright (c) 2012 - 2014 EMC Corporation
-#    All Rights Reserved
+# Copyright (c) 2014 EMC Corporation.
+# All Rights Reserved.
 #
-#    Licensed under EMC Freeware Software License Agreement
-#    You may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
 #
-#        https://github.com/emc-openstack/freeware-eula/
-#        blob/master/Freeware_EULA_20131217_modified.md
+#         http://www.apache.org/licenses/LICENSE-2.0
 #
-
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
 """
 VNX CLI on iSCSI
 """
 import os
+import random
 import re
 import time
 
-import random
-
+import eventlet
 try:
     import json
 except ImportError:
@@ -31,16 +33,17 @@ from cinder.openstack.common import lockutils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import loopingcall
 from cinder.openstack.common import processutils
+from cinder.openstack.common import timeutils
 from cinder import utils
+from cinder.volume.drivers.emc import queueworker
 from cinder.volume.drivers.san import san
 from cinder.volume import volume_types
+
 
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.01'
-
-LOG = logging.getLogger(__name__)
+VERSION = '03.00.02'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -71,10 +74,10 @@ loc_opts = [
                default=None,
                help='VNX secondary SP IP Address'),
     cfg.IntOpt('default_timeout',
-               default=-1,
+               default=60 * 24 * 365,
                help='Default Time Out For CLI operations'),
     cfg.IntOpt('max_luns_per_storage_group',
-               default=256,
+               default=255,
                help='Default max number of LUNs in a storage group'),
     cfg.BoolOpt('destroy_empty_storage_group',
                 default=False,
@@ -87,9 +90,36 @@ loc_opts = [
     cfg.BoolOpt('initiator_auto_registration',
                 default=False,
                 help='Automatically register initiators'),
+    cfg.IntOpt('attach_detach_batch_interval',
+               default=-1,
+               help='Interval by seconds between the '
+               'attach detach work. Set it to -1 will disable'
+               'the batch feature'),
 ]
 
 CONF.register_opts(loc_opts)
+
+
+def log_enter_exit(func):
+    if not CONF.debug:
+        return func
+
+    def inner(self, *args, **kwargs):
+        LOG.debug("Entering %(cls)s.%(method)s" %
+                  {'cls': self.__class__.__name__,
+                   'method': func.__name__})
+        start = timeutils.utcnow()
+        ret = func(self, *args, **kwargs)
+        end = timeutils.utcnow()
+        LOG.debug("Exiting %(cls)s.%(method)s. "
+                  "Spent %(duration)s sec. "
+                  "Return %(return)s" %
+                  {'cls': self.__class__.__name__,
+                   'duration': timeutils.delta_seconds(start, end),
+                   'method': func.__name__,
+                   'return': ret})
+        return ret
+    return inner
 
 
 class EMCVnxCLICmdError(exception.VolumeBackendAPIException):
@@ -115,6 +145,19 @@ class PropertyDescriptor(object):
         self.label = label
         self.key = key
         self.converter = converter
+
+
+class AddHluStatus(queueworker.Status):
+    NO_HLU_LEFT = -2
+
+
+class RemoveHluStatus(queueworker.Status):
+    HLU_NOT_IN_SG = -2
+
+
+class BatchOrderType(object):
+    ADD = 0
+    REMOVE = 1
 
 
 class CommandLineHelper(object):
@@ -176,13 +219,16 @@ class CommandLineHelper(object):
                              % {'path': navisecclipath})
 
         self.command = (navisecclipath, '-address')
-        self.storage_ip = configuration.san_ip
-        self.storage_vnx_ip_address_spa = configuration.san_ip
-        self.storage_vnx_ip_address_spb = configuration.san_secondary_ip
+        self.active_storage_ip = configuration.san_ip
+        self.primary_storage_ip = self.active_storage_ip
+        self.secondary_storage_ip = configuration.san_secondary_ip
         if not configuration.san_ip:
             errormessage += (_('Mandatory field configuration.san_ip \
                 is not set.'))
-
+        if self.secondary_storage_ip == self.primary_storage_ip:
+            LOG.warn(_("san_secondary_ip is configured as "
+                       "the same value as san_ip."))
+            self.secondary_storage_ip = None
         self.credentials = ()
         storage_username = configuration.san_login
         storage_password = configuration.san_password
@@ -221,8 +267,6 @@ class CommandLineHelper(object):
             raise exception.VolumeBackendAPIException(data=errormessage)
 
     def create_lun(self, poolname, name, size, thinness):
-        LOG.debug(_('Entering CommandLineHelper.create_lun.'))
-
         command_create_lun = ['lun', '-create',
                               '-type', thinness,
                               '-capacity', size,
@@ -241,11 +285,7 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_create_lun, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.create_lun.'))
-
     def delete_lun(self, name):
-        LOG.debug(_('Entering CommandLineHelper.delete_lun.'))
-
         command_delete_lun = ['lun', '-destroy',
                               '-name', name,
                               '-forceDetach',
@@ -260,8 +300,6 @@ class CommandLineHelper(object):
                          {'name': name, 'msg': out})
             else:
                 raise EMCVnxCLICmdError(command_delete_lun, rc, out)
-
-        LOG.debug(_('Exiting CommandLineHelper.delete_lun.'))
 
     def _wait_for_a_condition(self, testmethod, start_time, timeout=None):
         if timeout is None:
@@ -285,7 +323,6 @@ class CommandLineHelper(object):
             raise exception.VolumeBackendAPIException(data=msg)
 
     def create_lun_and_wait(self, poolname, name, size, thinness):
-        LOG.debug(_('Entering CommandLineHelper.create_lun_and_wait.'))
 
         self.create_lun(poolname, name, size, thinness)
 
@@ -297,11 +334,8 @@ class CommandLineHelper(object):
             self._wait_for_a_condition,
             lun_is_ready, int(time.time()))
         timer.start(interval=INTERVAL_5_SEC).wait()
-        LOG.debug(_('Exiting CommandLineHelper.create_lun_and_wait.'))
 
     def expand_lun(self, name, new_size):
-        LOG.debug(_('Entering CommandLineHelper.expand_lun.'))
-
         command_expand_lun = ('lun', '-expand',
                               '-name', name,
                               '-capacity', new_size,
@@ -318,10 +352,7 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_expand_lun, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.expand_lun.'))
-
     def expand_lun_and_wait(self, name, new_size):
-        LOG.debug(_('Entering CommandLineHelper.expand_lun_and_wait.'))
 
         self.expand_lun(name, new_size)
 
@@ -333,10 +364,8 @@ class CommandLineHelper(object):
             self._wait_for_a_condition,
             lun_is_extented, int(time.time()))
         timer.start(interval=INTERVAL_5_SEC).wait()
-        LOG.debug(_('Exiting CommandLineHelper.expand_lun_and_wait.'))
 
     def create_snapshot(self, volume_name, name):
-        LOG.debug(_('Entering CommandLineHelper.create_snapshot.'))
 
         data = self.get_lun_by_name(volume_name)
         if data[self.LUN_ID.key] is not None:
@@ -360,10 +389,7 @@ class CommandLineHelper(object):
             msg = _('Failed to get LUN ID for volume %s') % volume_name
             raise exception.VolumeBackendAPIException(data=msg)
 
-        LOG.debug(_('Exiting CommandLineHelper.create_snapshot.'))
-
     def delete_snapshot(self, name):
-        LOG.debug(_('Entering CommandLineHelper.delete_snapshot.'))
 
         def delete_snapshot_success():
             command_delete_snapshot = ('snap', '-destroy',
@@ -393,11 +419,7 @@ class CommandLineHelper(object):
             delete_snapshot_success, int(time.time()))
         timer.start(interval=INTERVAL_30_SEC).wait()
 
-        LOG.debug(_('Exiting CommandLineHelper.delete_snapshot.'))
-
     def create_mount_point(self, primary_lun_name, name):
-        LOG.debug(_('Entering CommandLineHelper.create_mount_point.'))
-
         command_create_mount_point = ('lun', '-create',
                                       '-type', 'snap',
                                       '-primaryLunName', primary_lun_name,
@@ -413,13 +435,9 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_create_mount_point, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.create_mount_point.'))
-
         return rc
 
     def attach_mount_point(self, name, snapshot_name):
-        LOG.debug(_('Entering CommandLineHelper.attach_mount_point.'))
-
         command_attach_mount_point = ('lun', '-attach',
                                       '-name', name,
                                       '-snapName', snapshot_name)
@@ -437,18 +455,15 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_attach_mount_point, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.attach_mount_point.'))
-
         return rc
 
     def check_smp_not_attached(self, smp_name):
         """Ensure a snap mount point with snap become a LUN."""
-        LOG.debug(_('Entering CommandLineHelper.check_smp_not_attached.'))
 
         def _wait_for_sync_status():
             lun_list = ('lun', '-list', '-name', smp_name,
                         '-attachedSnapshot')
-            out, rc = self.command_execute(*lun_list)
+            out, rc = self.command_execute(*lun_list, poll=True)
             if rc == 0:
                 vol_details = out.split('\n')
                 snap_name = vol_details[2].split(':')[1].strip()
@@ -460,10 +475,8 @@ class CommandLineHelper(object):
             self._wait_for_a_condition, _wait_for_sync_status,
             int(time.time()))
         timer.start(interval=INTERVAL_5_SEC).wait()
-        LOG.debug(_('Exiting CommandLineHelper.check_smp_not_attached.'))
 
     def migrate_lun(self, src_id, dst_id):
-        LOG.debug(_('Entering CommandLineHelper.migrate_lun.'))
         command_migrate_lun = ('migrate', '-start',
                                '-source', src_id,
                                '-dest', dst_id,
@@ -475,15 +488,11 @@ class CommandLineHelper(object):
 
         if 0 != rc:
             raise EMCVnxCLICmdError(command_migrate_lun, rc, out)
-        LOG.debug(_('Exiting CommandLineHelper.migrate_lun.'))
-
         return rc
 
     def migrate_lun_with_verification(self, src_id,
                                       dst_id=None,
                                       dst_name=None):
-        LOG.debug(_('Entering CommandLineHelper.'
-                    'migrate_lun_with_verification.'))
         try:
             self.migrate_lun(src_id, dst_id)
         except EMCVnxCLICmdError as ex:
@@ -494,7 +503,8 @@ class CommandLineHelper(object):
                          {'msg': ex.out})
                 migrate_lun_with_verification = ('migrate', '-list',
                                                  '-source', src_id)
-                out, rc = self.command_execute(*migrate_lun_with_verification)
+                out, rc = self.command_execute(*migrate_lun_with_verification,
+                                               poll=True)
                 if rc == 0:
                     migration_succeed = True
 
@@ -516,7 +526,8 @@ class CommandLineHelper(object):
             mig_ready = False
             migrate_lun_with_verification = ('migrate', '-list',
                                              '-source', src_id)
-            out, rc = self.command_execute(*migrate_lun_with_verification)
+            out, rc = self.command_execute(*migrate_lun_with_verification,
+                                           poll=True)
             LOG.debug(_("Migration output: %s") % out)
             if rc == 0:
                 #parse the percentage
@@ -541,27 +552,25 @@ class CommandLineHelper(object):
             int(time.time()), migrate_timeout)
         timer.start(interval=query_interval).wait()
 
-        LOG.debug(_('Exiting CommandLineHelper.'
-                    'migrate_lun_with_verification.'))
         return 0
 
-    def get_storage_group(self, name):
-        LOG.debug(_('Entering CommandLineHelper.get_storage_group.'))
-
+    def get_storage_group(self, name, poll=True):
         # ALU/HLU as key/value map
         lun_map = {}
 
         data = {'storage_group_name': name,
                 'storage_group_uid': None,
-                'lunmap': lun_map}
+                'lunmap': lun_map,
+                'raw_output': ''}
 
         command_get_storage_group = ('storagegroup', '-list',
                                      '-gname', name)
-
-        out, rc = self.command_execute(*command_get_storage_group)
+        out, rc = self.command_execute(*command_get_storage_group,
+                                       poll=poll)
         if rc != 0:
             raise EMCVnxCLICmdError(command_get_storage_group, rc, out)
 
+        data['raw_output'] = out
         re_stroage_group_id = 'Storage Group UID:\s*(.*)\s*'
         m = re.search(re_stroage_group_id, out)
         if m is not None:
@@ -578,12 +587,9 @@ class CommandLineHelper(object):
                 value = values.pop()
                 lun_map[int(key)] = int(value)
 
-        LOG.debug(_('Exiting CommandLineHelper.get_storage_group.'))
-
         return data
 
     def create_storage_group(self, name):
-        LOG.debug(_('Entering CommandLineHelper.create_storage_group.'))
 
         command_create_storage_group = ('storagegroup', '-create',
                                         '-gname', name)
@@ -598,10 +604,7 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_create_storage_group, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.create_storage_group.'))
-
     def delete_storage_group(self, name):
-        LOG.debug(_('Entering CommandLineHelper.delete_storage_group.'))
 
         command_delete_storage_group = ('storagegroup', '-destroy',
                                         '-gname', name, '-o')
@@ -617,11 +620,7 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_delete_storage_group, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.delete_storage_group.'))
-
     def connect_host_to_storage_group(self, hostname, sg_name):
-        LOG.debug(_('Entering CommandLineHelper.'
-                    'connect_host_to_storage_group.'))
 
         command_host_connect = ('storagegroup', '-connecthost',
                                 '-host', hostname,
@@ -632,13 +631,7 @@ class CommandLineHelper(object):
         if rc != 0:
             raise EMCVnxCLICmdError(command_host_connect, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.'
-                    'connect_host_to_storage_group.'))
-
     def disconnect_host_from_storage_group(self, hostname, sg_name):
-        LOG.debug(_('Entering CommandLineHelper.'
-                    'disconnect_host_from_storage_group.'))
-
         command_host_disconnect = ('storagegroup', '-disconnecthost',
                                    '-host', hostname,
                                    '-gname', sg_name,
@@ -656,42 +649,62 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_host_disconnect, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.'
-                    'disconnect_host_from_storage_group.'))
-
     def add_hlu_to_storage_group(self, hlu, alu, sg_name):
-        LOG.debug(_('Entering CommandLineHelper.add_hlu_to_storage_group.'))
+        """Add a lun into storage group as specified hlu number
+        Return True if the hlu is as specified, otherwise False
+        """
 
         command_add_hlu = ('storagegroup', '-addhlu',
                            '-hlu', hlu,
                            '-alu', alu,
                            '-gname', sg_name)
 
-        out, rc = self.command_execute(*command_add_hlu)
+        out, rc = self.command_execute(*command_add_hlu, poll=False)
         if rc != 0:
-            #Ignore the error that due to retry
-            if rc == 66 and \
-                    re.search("LUN.*already.*added to.*Storage Group",
-                              out) is not None:
-                LOG.warn(_("LUN %(lun)s has already added to "
-                           "Storage Group %(sgname)s."
-                           " Message: %(msg)s") %
-                         {'lun': alu, 'sgname': sg_name, 'msg': out})
+            # Do not need to consider the retry for add hlu
+            # Retry is handled in the caller
+            raise EMCVnxCLICmdError(command_add_hlu, rc, out)
+
+        return True
+
+    def add_hlus_to_storage_group(self, hlulist, alulist, sg_name):
+        """Add a lun into storage group as specified hlu number
+        Return True if the hlu is as specified, otherwise False
+        """
+        hlusstr = ",".join(map(lambda a: str(a), hlulist))
+        alusstr = ",".join(map(lambda a: str(a), alulist))
+        command_add_hlu = ('storagegroup', '-addhlu',
+                           '-gname', sg_name,
+                           '-hlus', hlusstr, '-verboseStatus',
+                           '-alus', alusstr, '-verboseStatus',
+                           '-o')
+
+        out, rc = self.command_execute(*command_add_hlu,
+                                       poll=False,
+                                       retry_disable=True)
+        added_alus_pattern = 'LUs Added:\s*([0-9,]*).'
+        searchout = re.search(added_alus_pattern, out)
+        if searchout is not None:
+            added_alus_str = searchout.group(1).strip()
+            if len(added_alus_str) != 0:
+                added_alus = map(lambda item: int(item),
+                                 added_alus_str.split(","))
             else:
-                raise EMCVnxCLICmdError(command_add_hlu, rc, out)
+                added_alus = []
+        else:
+            added_alus = []
 
-        LOG.debug(_('Exiting CommandLineHelper.add_hlu_to_storage_group.'))
+        added_alus = set(added_alus)
+        not_added_alus = set(alulist) - added_alus
+        return added_alus, not_added_alus
 
-    def remove_hlu_from_storagegroup(self, hlu, sg_name):
-        LOG.debug(_('Entering CommandLineHelper.'
-                    'remove_hlu_from_storagegroup.'))
+    def remove_hlu_from_storagegroup(self, hlu, sg_name, poll=False):
 
         command_remove_hlu = ('storagegroup', '-removehlu',
                               '-hlu', hlu,
                               '-gname', sg_name,
                               '-o')
-
-        out, rc = self.command_execute(*command_remove_hlu)
+        out, rc = self.command_execute(*command_remove_hlu, poll=poll)
         if rc != 0:
             #Ignore the error that due to retry
             if rc == 66 and\
@@ -702,11 +715,34 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_remove_hlu, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.remove_hlu_from_storagegroup.'))
+    def remove_hlus_from_storagegroup(self, hlus, sg_name):
+        hlusstr = ",".join(map(lambda a: str(a), hlus))
+        command_remove_hlu = ('storagegroup', '-removehlu',
+                              '-gname', sg_name,
+                              '-hlus', hlusstr, '-verboseStatus',
+                              '-o')
+
+        out, rc = self.command_execute(*command_remove_hlu,
+                                       poll=False,
+                                       retry_disable=True)
+        removed_alus_pattern = 'LUs Removed:\s*([0-9,]*).'
+        searchout = re.search(removed_alus_pattern, out)
+        if searchout is not None:
+            removed_alus_str = searchout.group(1).strip()
+            if len(removed_alus_str) != 0:
+                removed_hlus = map(lambda item: int(item),
+                                   removed_alus_str.split(","))
+            else:
+                removed_hlus = []
+        else:
+            removed_hlus = []
+
+        removed_hlus = set(removed_hlus)
+        not_removed_hlus = set(hlus) - removed_hlus
+
+        return removed_hlus, not_removed_hlus
 
     def get_iscsi_protocol_endpoints(self, device_sp):
-        LOG.debug(_('Entering CommandLineHelper.'
-                    'get_iscsi_protocol_endpoints.'))
 
         command_get_port = ('connection', '-getport',
                             '-sp', device_sp)
@@ -718,53 +754,54 @@ class CommandLineHelper(object):
         re_port_wwn = 'Port WWN:\s*(.*)\s*'
         initiator_address = re.findall(re_port_wwn, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.get_iscsi_protocol_endpoints.'))
-
         return initiator_address
 
-    def get_lun_by_name(self, name, properties=LUN_ALL):
-        LOG.debug(_('Entering CommandLineHelper.get_lun_by_name.'))
+    def get_lun_by_name(self, name, properties=LUN_ALL, poll=True):
 
-        data = self.get_lun_properties(('-name', name), properties)
-        LOG.debug(_('Exiting CommandLineHelper.get_lun_by_name.'))
+        data = self.get_lun_properties(('-name', name),
+                                       properties,
+                                       poll=poll)
         return data
 
-    def get_lun_by_id(self, lunid, properties=LUN_ALL):
-        LOG.debug(_('Entering CommandLineHelper.get_lun_by_id.'))
-        data = self.get_lun_properties(('-l', lunid), properties)
-        LOG.debug(_('Exiting CommandLineHelper.get_lun_by_id.'))
+    def get_lun_by_id(self, lunid, properties=LUN_ALL, poll=True):
+        data = self.get_lun_properties(('-l', lunid),
+                                       properties,
+                                       poll=poll)
         return data
 
-    def get_pool(self, name):
-        LOG.debug(_('Entering CommandLineHelper.get_pool.'))
-        data = self.get_pool_properties(('-name', name))
-        LOG.debug(_('Exiting CommandLineHelper.get_pool.'))
-
+    def get_pool(self, name, poll=True):
+        data = self.get_pool_properties(('-name', name),
+                                        poll=poll)
         return data
 
-    def get_pool_properties(self, filter_option, properties=POOL_ALL):
+    def get_pool_properties(self, filter_option, properties=POOL_ALL,
+                            poll=True):
         module_list = ('storagepool', '-list')
         return self.get_lun_or_pool_properties(
             module_list, filter_option,
             base_properties=[self.POOL_NAME],
-            adv_properties=properties)
+            adv_properties=properties,
+            poll=poll)
 
-    def get_lun_properties(self, filter_option, properties=LUN_ALL):
+    def get_lun_properties(self, filter_option, properties=LUN_ALL,
+                           poll=True):
         module_list = ('lun', '-list')
         return self.get_lun_or_pool_properties(
             module_list, filter_option,
             base_properties=[self.LUN_NAME, self.LUN_ID],
-            adv_properties=properties)
+            adv_properties=properties,
+            poll=poll)
 
     def get_lun_or_pool_properties(self, module_list,
                                    filter_option,
                                    base_properties=[],
-                                   adv_properties=[]):
+                                   adv_properties=[],
+                                   poll=True):
         # to do instance check
         command_get_lun = module_list + filter_option
         for prop in adv_properties:
             command_get_lun += (prop.option, )
-        out, rc = self.command_execute(*command_get_lun)
+        out, rc = self.command_execute(*command_get_lun, poll=poll)
 
         if rc != 0:
             raise EMCVnxCLICmdError(command_get_lun, rc, out)
@@ -776,8 +813,7 @@ class CommandLineHelper(object):
         for prop in adv_properties:
             data[prop.key] = self._get_property_value(out, prop)
 
-        LOG.debug(data)
-        LOG.debug('Exit get lun propeties')
+        LOG.debug('Return LUN or Pool properties. Data: %s' % data)
         return data
 
     def _get_property_value(self, out, propertyDescriptor):
@@ -800,10 +836,10 @@ class CommandLineHelper(object):
             return None
 
     #Return a pool list
-    def get_pool_list(self):
+    def get_pool_list(self, poll=True):
         temp_cache = []
         cmd = ('storagepool', '-list', '-availableCap', '-state')
-        out, rc = self.command_execute(*cmd)
+        out, rc = self.command_execute(*cmd, poll=poll)
         if rc != 0:
             raise EMCVnxCLICmdError(cmd, rc, out)
 
@@ -824,14 +860,14 @@ class CommandLineHelper(object):
             pass
         return temp_cache
 
-    def get_array_serial(self):
+    def get_array_serial(self, poll=False):
         """return array Serial No for pool backend."""
-        LOG.debug(_('Entering CommandLineHelper.get_array_serial.'))
         stats = {'array_serial': 'unknown'}
 
         command_get_array_serial = ('getagent', '-serial')
         # Set the property timeout to get array serial
-        out, rc = self.command_execute(*command_get_array_serial)
+        out, rc = self.command_execute(*command_get_array_serial,
+                                       poll=poll)
         if 0 == rc:
             m = re.search(r'Serial No:\s+(\w+)', out)
             if m:
@@ -841,15 +877,13 @@ class CommandLineHelper(object):
         else:
             raise EMCVnxCLICmdError(command_get_array_serial, rc, out)
 
-        LOG.debug(_('Exiting CommandLineHelper.get_array_serial.'))
         return stats
 
-    def get_target_wwns(self, storage_group_name):
+    def get_target_wwns(self, storage_group_name, poll=True):
         """Function to get target port wwns."""
 
-        LOG.debug(_('Entering CommandLineHelper.get_target_wwns.'))
         cmd_get_hba = ('storagegroup', '-list', '-gname', storage_group_name)
-        out, rc = self.command_execute(*cmd_get_hba)
+        out, rc = self.command_execute(*cmd_get_hba, poll=poll)
         wwns = []
         if 0 == rc:
             _re_hba_sp_pair = re.compile('((\w\w:){15}(\w\w)\s*' +
@@ -870,11 +904,9 @@ class CommandLineHelper(object):
                     wwns.append(wwn)
         else:
             raise EMCVnxCLICmdError(cmd_get_hba, rc, out)
-        LOG.debug(_('Exiting Command.get_target_wwns.'))
         return wwns
 
     def get_port_wwn(self, sp, port_id, allports=None):
-        LOG.debug(_('Entering CommandLineHelper.get_port_wwn.'))
         wwn = None
         if allports is None:
             cmd_get_port = ('port', '-list', '-sp')
@@ -891,7 +923,6 @@ class CommandLineHelper(object):
         _obj_search = re.search(_re_port_wwn, allports)
         if _obj_search is not None:
             wwn = _obj_search.group(1).replace(':', '')[16:]
-        LOG.debug(_('Exiting Command.get_port_wwn.'))
         return wwn
 
     def get_fc_targets(self):
@@ -915,9 +946,9 @@ class CommandLineHelper(object):
                                            'Port ID': sp_port_id})
             return fc_target_dict
 
-    def get_iscsi_targets(self):
+    def get_iscsi_targets(self, poll=False):
         cmd_getport = ('connection', '-getport', '-address', '-vlanid')
-        out, rc = self.command_execute(*cmd_getport)
+        out, rc = self.command_execute(*cmd_getport, poll=poll)
         if rc != 0:
             raise EMCVnxCLICmdError(cmd_getport, rc, out)
         else:
@@ -950,21 +981,16 @@ class CommandLineHelper(object):
                                                   'IP Address': ip_addr})
             return iscsi_target_dict
 
-    def get_registered_spport_set(self, initiator_iqn, sgname):
-        sg_list = ('storagegroup', '-list', '-gname', sgname)
-        out, rc = self.command_execute(*sg_list)
+    def get_registered_spport_set(self, initiator_iqn, sgname, sg_raw_out):
         spport_set = set()
-        if rc == 0:
-            for m_spport in re.finditer(r'\n\s+%s\s+SP\s(A|B)\s+(\d+)' %
-                                        initiator_iqn,
-                                        out,
-                                        flags=re.IGNORECASE):
-                spport_set.add((m_spport.group(1), int(m_spport.group(2))))
-                LOG.debug(_('See path %(path)s in %(sg)s')
-                          % ({'path': m_spport.group(0),
-                              'sg': sgname}))
-        else:
-            raise EMCVnxCLICmdError(sg_list, rc, out)
+        for m_spport in re.finditer(r'\n\s+%s\s+SP\s(A|B)\s+(\d+)' %
+                                    initiator_iqn,
+                                    sg_raw_out,
+                                    flags=re.IGNORECASE):
+            spport_set.add((m_spport.group(1), int(m_spport.group(2))))
+            LOG.debug(_('See path %(path)s in %(sg)s')
+                      % ({'path': m_spport.group(0),
+                          'sg': sgname}))
         return spport_set
 
     def ping_node(self, target_portal, initiator_ip):
@@ -972,7 +998,8 @@ class CommandLineHelper(object):
                                target_portal['SP'], '-portid',
                                target_portal['Port ID'], '-vportid',
                                target_portal['Virtual Port ID'],
-                               '-address', initiator_ip)
+                               '-address', initiator_ip,
+                               '-count', '1')
         out, rc = self.command_execute(*connection_pingnode)
         if rc == 0:
             ping_ok = re.compile(r'Reply from %s' % initiator_ip)
@@ -985,7 +1012,8 @@ class CommandLineHelper(object):
 
     def find_avaialable_iscsi_target_one(self, hostname,
                                          preferred_sp,
-                                         registered_spport_set):
+                                         registered_spport_set,
+                                         all_iscsi_targets):
         if self.iscsi_initiator_map and hostname in self.iscsi_initiator_map:
             iscsi_initiator_ips = list(self.iscsi_initiator_map[hostname])
             random.shuffle(iscsi_initiator_ips)
@@ -998,8 +1026,7 @@ class CommandLineHelper(object):
             target_sps = ('B', 'A')
 
         for target_sp in target_sps:
-            iscsi_targets = self.get_iscsi_targets()
-            target_portals = list(iscsi_targets[target_sp])
+            target_portals = list(all_iscsi_targets[target_sp])
             random.shuffle(target_portals)
             for target_portal in target_portals:
                 spport = (target_portal['SP'], target_portal['Port ID'])
@@ -1014,10 +1041,10 @@ class CommandLineHelper(object):
                         if self.ping_node(target_portal, initiator_ip):
                             return target_portal
                 else:
-                    LOG.debug(_("No iSCSI IP addresses of %s is known"),
-                              hostname)
-                    LOG.debug(_("Return a random iSCSI target portal %s"),
-                              target_portal)
+                    LOG.debug("No iSCSI IP address of %(hostname)s is known. "
+                              "Return a random iSCSI target portal %(portal)s."
+                              %
+                              {'hostname': hostname, 'portal': target_portal})
                     return target_portal
 
     def _is_sp_unavailable_error(self, out):
@@ -1028,98 +1055,97 @@ class CommandLineHelper(object):
         return pattern.match(out)
 
     def command_execute(self, *command, **kwargv):
-        if "check_exit_code" not in kwargv:
-            kwargv["check_exit_code"] = True
-        #NOTE: retry_disable need to be removed from kwargv
-        #before it pass to utils.execute, otherwise exception will thrown
+        """Execute command on the VNX array, when there is
+        named parameter poll=False, the command will be sent
+        alone with np option
+        """
+        # NOTE: retry_disable need to be removed from kwargv
+        # before it pass to utils.execute, otherwise exception will thrown
         retry_disable = kwargv.pop('retry_disable', False)
-        try_times = 1 if retry_disable else 2
+        # TODO(Tina): Do not do the SP alive check every time
+        if self._is_sp_alive(self.active_storage_ip):
+            out, rc = self._command_execute_on_active_ip(*command, **kwargv)
+            if not retry_disable and self._is_sp_unavailable_error(out):
+                # When active sp is unavailble, swith to another sp
+                # and set it to active and force a poll
+                if self._toggle_sp():
+                    LOG.debug('EMC: Command Exception: %(rc) %(result)s. '
+                              'Retry on another SP.' % {'rc': rc,
+                                                        'result': out})
+                    kwargv['poll'] = True
+                    out, rc = self._command_execute_on_active_ip(*command,
+                                                                 **kwargv)
+        elif self._toggle_sp():
+            # If active ip is not accessible, toggled to another sp
+            kwargv['poll'] = True
+            out, rc = self._command_execute_on_active_ip(*command, **kwargv)
+        else:
+            # Active IP is inaccessible, and cannot toggle to another SP,
+            # return Error
+            out, rc = "Server Unavailable", 255
 
-        rc = 0
-        out = ""
-        is_sp_alive = self._determine_if_sp_alive(**kwargv)
-        if not is_sp_alive:
-            rc = 255
-            out = "Server unreachable"
-            return out, rc
-
-        num_of_tries = 0
-        while num_of_tries < try_times:
-            try:
-                rc = 0
-                need_terminated = False
-                new_sp = (self.storage_ip,)
-                out, err = utils.execute(
-                    *(self.command + new_sp + self.credentials + command),
-                    **kwargv)
-                if not need_terminated:
-                    break
-            except processutils.ProcessExecutionError as pe:
-                rc = pe.exit_code
-                out = pe.stdout
-                out = out.replace('\n', ' ')
-                LOG.debug(_('EMC: Exception out trace: %s') % out)
-                if self._is_sp_unavailable_error(out):
-                    is_sp_toggled = self._toggle_ip()
-                    if not is_sp_toggled:
-                        need_terminated = True
-                else:
-                    need_terminated = True
-            finally:
-                if need_terminated:
-                    break
-                num_of_tries += 1
-
-        LOG.debug(_('EMC: Command: %(command)s')
-                  % {'command': self.command + self.credentials + command})
-        LOG.debug(_('EMC: Command Result: %(result)s') % {'result': out})
+        LOG.debug('EMC: Command: %(command)s.'
+                  % {'command': self.command + command})
+        LOG.debug('EMC: Command Result: %(result)s.' %
+                  {'result': out.replace('\n', '\\n')})
 
         return out, rc
 
-    def _determine_if_sp_alive(self, **kwargv):
-        """This function determine if the sp is alive before
-        issuing the command, otherwise toggle to the other sp
-        """
+    def _command_execute_on_active_ip(self, *command, **kwargv):
         if "check_exit_code" not in kwargv:
             kwargv["check_exit_code"] = True
-
         rc = 0
         out = ""
-        ping_cmd = ('ping', '-c', 1, self.storage_ip)
+        need_poll = kwargv.pop('poll', True)
+        if "-np" not in command and not need_poll:
+            command = ("-np",) + command
 
         try:
-            out, err = utils.execute(*ping_cmd, **kwargv)
+            active_ip = (self.active_storage_ip,)
+            out, err = utils.execute(
+                *(self.command
+                  + active_ip
+                  + self.credentials
+                  + command),
+                **kwargv)
+        except processutils.ProcessExecutionError as pe:
+            rc = pe.exit_code
+            out = pe.stdout
+            out = out.replace('\n', '\\n')
+        return out, rc
+
+    def _is_sp_alive(self, ipaddr):
+        ping_cmd = ('ping', '-c', 1, ipaddr)
+        try:
+            out, err = utils.execute(*ping_cmd,
+                                     check_exit_code=True)
         except processutils.ProcessExecutionError as pe:
             out = pe.stdout
             rc = pe.exit_code
             if rc != 0:
-                return self._toggle_ip()
-
-        LOG.debug(_('EMC: Command Result: %(result)s') % {'result': out})
+                LOG.debug('%s is unavaialbe' % ipaddr)
+                return False
+        LOG.debug('Ping SP %(spip)s Command Result: %(result)s.' %
+                  {'spip': self.active_storage_ip, 'result': out})
         return True
 
-    def _toggle_ip(self):
-        """This function toggels the storage IP
-        Address between SPA and SPB, if no SP IP address has
+    def _toggle_sp(self):
+        """This function toggles the storage IP
+        Address between primary IP and secondary IP, if no SP IP address has
         exchanged, return False, otherwise True will be returned.
         """
-        old_sp = self.storage_ip
-        if self.storage_ip != self.storage_vnx_ip_address_spa\
-                and self.storage_vnx_ip_address_spa:
-            self.storage_ip = self.storage_vnx_ip_address_spa
-        elif self.storage_ip != self.storage_vnx_ip_address_spb\
-                and self.storage_vnx_ip_address_spb:
-            self.storage_ip = self.storage_vnx_ip_address_spb
-
-        new_sp = self.storage_ip
-        if(old_sp != new_sp):
-            LOG.info(_('Toggle storage_vnx_ip_adress from %(old)s to '
-                       '%(new)s')
-                     % {'old': old_sp,
-                        'new': new_sp})
-            return True
-        else:
+        if self.secondary_storage_ip is None:
             return False
+        old_ip = self.active_storage_ip
+        self.active_storage_ip = self.secondary_storage_ip if\
+            self.active_storage_ip == self.primary_storage_ip else\
+            self.primary_storage_ip
+
+        LOG.info(_('Toggle storage_vnx_ip_adress from %(old)s to '
+                   '%(new)s.') %
+                 {'old': old_ip,
+                  'new': self.active_storage_ip})
+        return True
 
 
 class EMCVnxCliBase(object):
@@ -1141,16 +1167,41 @@ class EMCVnxCliBase(object):
         self.destroy_empty_sg = self.configuration.destroy_empty_storage_group
         self.itor_auto_reg = self.configuration.initiator_auto_registration
         self.max_retries = 5
+        self.attach_detach_batch_interval = \
+            self.configuration.attach_detach_batch_interval
         if self.destroy_empty_sg:
             LOG.warn(_("destroy_empty_storage_group=True"))
         if not self.itor_auto_reg:
             LOG.warn(_("initiator auto registration not enabled"))
         self.hlu_set = set(xrange(1, self.max_luns_per_sg + 1))
         self._client = CommandLineHelper(self.configuration)
+        self.array_serial = None
+        if self.protocol == 'iSCSI':
+            self.iscsi_targets = self._client.get_iscsi_targets(poll=True)
+
+        if self.attach_detach_batch_interval < 0:
+            self.hlu_cache = {}
+            self.do_initialize_connection = self._do_initialize_connection
+            self.do_terminate_connection = self._do_terminate_connection
+        else:
+            self.addhlu_workers = {}
+            self.do_initialize_connection =\
+                self._do_initialize_connection_in_batch
+            self.do_terminate_connection =\
+                self._do_terminate_connection_in_batch
 
     def get_target_storagepool(self, volume, source_volume_name=None):
         raise NotImplementedError
 
+    def dumps_provider_location(self, pl_dict):
+        return '|'.join([k + '^' + pl_dict[k] for k in pl_dict])
+
+    def get_array_serial(self):
+        if not self.array_serial:
+            self.array_serial = self._client.get_array_serial()
+        return self.array_serial['array_serial']
+
+    @log_enter_exit
     def create_volume(self, volume):
         """Creates a EMC volume."""
         LOG.debug(_('Entering create_volume.'))
@@ -1167,13 +1218,23 @@ class EMCVnxCliBase(object):
 
         self._client.create_lun_and_wait(
             storagepool, volumename, volumesize, thinness)
+        lun = self._client.get_lun_by_name(volumename, poll=False)
+        pl_dict = {'system': self.get_array_serial(),
+                   'type': 'lun',
+                   'id': str(lun['lun_id'])}
+        model_update = {'provider_location':
+                        self.dumps_provider_location(pl_dict)}
+        volume['provider_location'] = model_update['provider_location']
+        return model_update
 
+    @log_enter_exit
     def delete_volume(self, volume):
         """Deletes an EMC volume."""
 
         LOG.debug(_('Entering delete_volume.'))
         self._client.delete_lun(volume['name'])
 
+    @log_enter_exit
     def extend_volume(self, volume, new_size):
         """Extends an EMC volume."""
 
@@ -1181,6 +1242,7 @@ class EMCVnxCliBase(object):
 
         self._client.expand_lun_and_wait(volume['name'], new_size)
 
+    @log_enter_exit
     def migrate_volume(self, ctxt, volume, host):
         """leverage the VNX on-array migration functionality, \
            here is entry in source Backend.
@@ -1200,8 +1262,8 @@ class EMCVnxCliBase(object):
         if len(target_pool_name) == 0:
             return false_ret
         #source and destination should be on same array
-        array_serial = self._client.get_array_serial()
-        if target_array_serial != array_serial['array_serial']:
+        array_serial = self.get_array_serial()
+        if target_array_serial != array_serial:
             LOG.warn(_('Not on same array, '
                        'skipping storage-assisted migration.'))
             return false_ret
@@ -1214,13 +1276,13 @@ class EMCVnxCliBase(object):
         #first create a new volume with same name and size of source volume
         new_volume_name = "%(src)s-%(ts)s" % {'src': volume['name'],
                                               'ts': int(time.time())}
-        src_id = self.get_lun_id(volume['name'])
+        src_id = self.get_lun_id(volume)
 
         thinness = self._get_provisioning_by_volume(volume)
         self._client.create_lun_and_wait(
             target_pool_name,
             new_volume_name, volume['size'], thinness)
-        dst_id = self.get_lun_id(new_volume_name)
+        dst_id = self.get_lun_id_by_name(new_volume_name)
         rc = self._client.migrate_lun_with_verification(
             src_id, dst_id, new_volume_name)
         moved = False
@@ -1229,23 +1291,11 @@ class EMCVnxCliBase(object):
         return moved, {}
 
     def update_volume_status(self):
+        if self.protocol == 'iSCSI':
+            self.iscsi_targets = self._client.get_iscsi_targets()
         return self.stats
 
-    def create_export(self, context, volume):
-        """Driver entry point to get the export info for a new volume."""
-        volumename = volume['name']
-
-        data = self._client.get_lun_by_name(volumename)
-
-        device_id = data['lun_id']
-
-        LOG.debug(_('create_export: Volume: %(volume)s  Device ID: '
-                  '%(device_id)s')
-                  % {'volume': volumename,
-                     'device_id': device_id})
-
-        return {'provider_location': device_id}
-
+    @log_enter_exit
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
         LOG.debug(_('Entering create_snapshot.'))
@@ -1259,6 +1309,7 @@ class EMCVnxCliBase(object):
 
         self._client.create_snapshot(volumename, snapshotname)
 
+    @log_enter_exit
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot."""
         LOG.debug(_('Entering delete_snapshot.'))
@@ -1270,6 +1321,7 @@ class EMCVnxCliBase(object):
 
         self._client.delete_snapshot(snapshotname)
 
+    @log_enter_exit
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
         LOG.debug(_('Entering create_volume_from_snapshot.'))
@@ -1298,14 +1350,24 @@ class EMCVnxCliBase(object):
             LOG.error(msg)
             raise ex
 
-        source_vol_lun_id = self.get_lun_id(volume['name'])
-        temp_vol_lun_id = self.get_lun_id(dest_volume_name)
+        source_vol_lun_id = self.get_lun_id(volume)
+        temp_vol_lun_id = self.get_lun_id_by_name(dest_volume_name)
 
         LOG.info(_('Migrating Mount Point Volume: %s ') % (volume_name))
         self._client.migrate_lun_with_verification(source_vol_lun_id,
                                                    temp_vol_lun_id, None)
         self._client.check_smp_not_attached(volume_name)
 
+        data = self._client.get_lun_by_name(volume_name)
+        pl_dict = {'system': self.get_array_serial(),
+                   'type': 'lun',
+                   'id': str(data['lun_id'])}
+        model_update = {'provider_location':
+                        self.dumps_provider_location(pl_dict)}
+        volume['provider_location'] = model_update['provider_location']
+        return model_update
+
+    @log_enter_exit
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume."""
 
@@ -1321,13 +1383,30 @@ class EMCVnxCliBase(object):
         #Create temp Snapshot
         self.create_snapshot(snapshot)
         #Create volume
-        self.create_volume_from_snapshot(volume, snapshot)
+        model_update = self.create_volume_from_snapshot(volume, snapshot)
         #Delete temp Snapshot
         self.delete_snapshot(snapshot)
+        return model_update
 
-    def get_lun_id(self, volume_name):
+    def get_lun_id_by_name(self, volume_name):
         data = self._client.get_lun_by_name(volume_name)
         return data['lun_id']
+
+    def get_lun_id(self, volume):
+        lun_id = None
+        try:
+            if volume.get('provider_location') is not None:
+                lun_id = int(
+                    volume['provider_location'].split('|')[2].split('^')[1])
+            if not lun_id:
+                LOG.debug('Lun id is not stored in provider location, '
+                          'query it.')
+                lun_id = self._client.get_lun_by_name(volume['name'])['lun_id']
+        except Exception as ex:
+            LOG.debug('Exception when getting lun id: %s.' % (ex))
+            lun_id = self._client.get_lun_by_name(volume['name'])['lun_id']
+        LOG.debug('Get lun_id: %s.' % (lun_id))
+        return lun_id
 
     def get_lun_map(self, storage_group):
         data = self._client.get_storage_group(storage_group)
@@ -1438,8 +1517,8 @@ class EMCVnxCliBase(object):
                 raise EMCVnxCLICmdError(cmd_fc_setpath, rc, out)
 
     def _register_iscsi_initiator(self, ip, host, initiator_uids):
+        iscsi_targets = self.iscsi_targets
         for initiator_uid in initiator_uids:
-            iscsi_targets = self._client.get_iscsi_targets()
             LOG.info(_('Get ISCSI targets %(tg)s to register initiator %(in)s')
                      % ({'tg': iscsi_targets,
                          'in': initiator_uid}))
@@ -1462,8 +1541,8 @@ class EMCVnxCliBase(object):
                                            ip, host, vport_id)
 
     def _register_fc_initiator(self, ip, host, initiator_uids):
+        fc_targets = self._client.get_fc_targets()
         for initiator_uid in initiator_uids:
-            fc_targets = self._client.get_fc_targets()
             LOG.info(_('Get FC targets %(tg)s to register initiator %(in)s')
                      % ({'tg': fc_targets,
                          'in': initiator_uid}))
@@ -1483,16 +1562,12 @@ class EMCVnxCliBase(object):
                 self._exec_command_setpath(initiator_uid, sp, port_id,
                                            ip, host)
 
-    def _filter_unregistered_initiators(self, initiator_uids=[]):
+    def _filter_unregistered_initiators(self, initiator_uids, sgdata):
         unregistered_initiators = []
         if not initiator_uids:
             return unregistered_initiators
 
-        command_get_storage_group = ('storagegroup', '-list')
-        out, rc = self._client.command_execute(*command_get_storage_group)
-
-        if rc != 0:
-            raise EMCVnxCLICmdError(command_get_storage_group, rc, out)
+        out = sgdata['raw_output']
 
         for initiator_uid in initiator_uids:
             m = re.search(initiator_uid, out)
@@ -1500,112 +1575,154 @@ class EMCVnxCliBase(object):
                 unregistered_initiators.append(initiator_uid)
         return unregistered_initiators
 
-    def auto_register_initiator(self, connector):
-        """Automatically register available initiators."""
+    def auto_register_initiator(self, connector, sgdata):
+        """Automatically register available initiators.
+        Return True if has registerred initiator otherwise return False
+        """
         initiator_uids = []
         ip = connector['ip']
         host = connector['host']
         if self.protocol == 'iSCSI':
             initiator_uids = self._extract_iscsi_uids(connector)
-            itors_toReg = self._filter_unregistered_initiators(initiator_uids)
+            if sgdata is not None:
+                itors_toReg = self._filter_unregistered_initiators(
+                    initiator_uids,
+                    sgdata)
+            else:
+                itors_toReg = initiator_uids
+
+            if len(itors_toReg) == 0:
+                return False
+
             LOG.info(_('iSCSI Initiators %(in)s of %(ins)s need registration')
                      % ({'in': itors_toReg,
                          'ins': initiator_uids}))
-            if not itors_toReg:
-                LOG.info(_('Initiators %s are already registered')
-                         % initiator_uids)
-                return
             self._register_iscsi_initiator(ip, host, itors_toReg)
+            return True
 
         elif self.protocol == 'FC':
             initiator_uids = self._extract_fc_uids(connector)
-            itors_toReg = self._filter_unregistered_initiators(initiator_uids)
+            if sgdata is not None:
+                itors_toReg = self._filter_unregistered_initiators(
+                    initiator_uids,
+                    sgdata)
+            else:
+                itors_toReg = initiator_uids
+
+            if len(itors_toReg) == 0:
+                return False
+
             LOG.info(_('FC Initiators %(in)s of %(ins)s need registration')
                      % ({'in': itors_toReg,
                          'ins': initiator_uids}))
-            if not itors_toReg:
-                LOG.info(_('Initiators %s are already registered')
-                         % initiator_uids)
-                return
             self._register_fc_initiator(ip, host, itors_toReg)
+            return True
 
-    def assure_host_access(self, volumename, connector):
+    def assure_host_access(self, volume, connector):
         hostname = connector['host']
+        volumename = volume['name']
         auto_registration_done = False
         try:
-            self.get_storage_group_uid(hostname)
+            sgdata = self._client.get_storage_group(hostname,
+                                                    poll=False)
         except EMCVnxCLICmdError as ex:
             if ex.rc != 83:
                 raise ex
             # Storage Group has not existed yet
             self.assure_storage_group(hostname)
             if self.itor_auto_reg:
-                self.auto_register_initiator(connector)
+                self.auto_register_initiator(connector, None)
                 auto_registration_done = True
             else:
                 self._client.connect_host_to_storage_group(hostname, hostname)
 
+            sgdata = self._client.get_storage_group(hostname,
+                                                    poll=True)
+
         if self.itor_auto_reg and not auto_registration_done:
-            self.auto_register_initiator(connector)
-            auto_registration_done = True
+            new_registerred = self.auto_register_initiator(connector, sgdata)
+            if new_registerred:
+                sgdata = self._client.get_storage_group(hostname,
+                                                        poll=True)
 
-        lun_id = self.get_lun_id(volumename)
-        lun_map = self.get_lun_map(hostname)
-        if lun_id in lun_map:
-            return lun_map[lun_id]
-        used_hlus = lun_map.values()
-        if len(used_hlus) >= self.max_luns_per_sg:
-            msg = _('Reach limitation set by configuration '
-                    'option max_luns_per_storage_group. '
-                    'Operation to add %(vol)s into '
-                    'Storage Group %(sg)s is rejected') % \
-                {'vol': volumename,
-                 'sg': hostname}
-            LOG.error(msg)
-            raise exception.CinderException(msg)
+        lun_id = self.get_lun_id(volume)
+        tried = 0
+        while tried < self.max_retries:
+            tried += 1
+            lun_map = sgdata['lunmap']
+            used_hlus = lun_map.values()
+            candidate_hlus = self.filter_available_hlu_set(used_hlus)
+            candidate_hlus = list(candidate_hlus)
 
-        candidate_hlus = self.filter_available_hlu_set(used_hlus)
-        for i, hlu in enumerate(candidate_hlus):
-            if i >= self.max_retries:
-                break
-            try:
-                self._client.add_hlu_to_storage_group(
-                    hlu,
-                    lun_id,
-                    hostname)
-                return hlu
-            except EMCVnxCLICmdError as ex:
-                # Retry
-                continue
+            if len(candidate_hlus) != 0:
+                hlu = candidate_hlus[random.randint(0,
+                                                    len(candidate_hlus) - 1)]
+                try:
+                    self._client.add_hlu_to_storage_group(
+                        hlu,
+                        lun_id,
+                        hostname)
+
+                    if hostname not in self.hlu_cache:
+                        self.hlu_cache[hostname] = {}
+                    self.hlu_cache[hostname][lun_id] = hlu
+                    return hlu, sgdata
+                except EMCVnxCLICmdError as ex:
+                    LOG.debug("Add HLU to storagegroup failed, retry %s" %
+                              tried)
+            elif tried == 1:
+                # The first tried didn't get the in time data,
+                # so we need a retry
+                LOG.debug("Add HLU to storagegroup failed, retry %s" %
+                          tried)
+            else:
+                msg = (_('Reach limitation set by configuration '
+                         'option max_luns_per_storage_group. '
+                         'Operation to add %(vol)s into '
+                         'Storage Group %(sg)s is rejected.')
+                       % {'vol': volumename, 'sg': hostname})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+
+            # Query storage group with poll for retry
+            # we need a full poll to get the real in time data
+            sgdata = self._client.get_storage_group(hostname, poll=True)
+            self.hlu_cache[hostname] = sgdata['lunmap']
+            if lun_id in sgdata['lunmap']:
+                hlu = sgdata['lunmap'][lun_id]
+                return hlu, sgdata
 
         msg = _("Failed to add %(vol)s into %(sg)s "
-                "after %(retries)s tries") % \
+                "after %(retries)s tries.") % \
             {'vol': volumename,
              'sg': hostname,
-             'retries': min(self.max_retries, len(candidate_hlus))}
+             'retries': tried}
         LOG.error(msg)
         raise exception.VolumeBackendAPIException(data=msg)
 
-    def _get_iscsi_properties(self, volume, connector):
+    def _get_iscsi_properties(self, volume, connector, hlu, sg_raw_output):
         storage_group = connector['host']
-        device_info = self.find_device_details(volume, storage_group)
-        owner_sp = device_info['ownersp']
+        owner_sp = self._client.get_lun_by_name(volume['name'],
+                                                poll=False)['owner']
         registered_spports = self._client.get_registered_spport_set(
             connector['initiator'],
-            storage_group)
+            storage_group,
+            sg_raw_output)
         target = self._client.find_avaialable_iscsi_target_one(
             storage_group, owner_sp,
-            registered_spports)
+            registered_spports,
+            self.iscsi_targets)
         properties = {'target_discovered': True,
                       'target_iqn': 'unknown',
                       'target_portal': 'unknown',
-                      'target_lun': 'unknown'}
+                      'target_lun': 'unknown',
+                      'volume_id': volume['id']}
         if target:
             properties = {'target_discovered': True,
                           'target_iqn': target['Port WWN'],
                           'target_portal': "%s:3260" % target['IP Address'],
-                          'target_lun': device_info['hostlunid']}
-            LOG.debug(_("iSCSI Properties: %s"), properties)
+                          'target_lun': hlu}
+            LOG.debug("iSCSI Properties: %s", properties)
             auth = volume['provider_auth']
             if auth:
                 (auth_method, auth_username, auth_secret) = auth.split()
@@ -1613,69 +1730,339 @@ class EMCVnxCliBase(object):
                 properties['auth_username'] = auth_username
                 properties['auth_password'] = auth_secret
         else:
-            LOG.error(_('Failed to find an available iSCSI targets for %s'),
+            LOG.error(_('Failed to find an available iSCSI targets for %s.'),
                       storage_group)
 
         return properties
 
+    @log_enter_exit
     def initialize_connection(self, volume, connector):
         """Initializes the connection and returns connection info."""
-        @lockutils.synchronized('emc-connection-' + connector['host'],
-                                "emc-connection-", True)
-        def do_initialize_connection():
-            device_number = self.assure_host_access(
-                volume['name'], connector)
-            return device_number
+
         if self.protocol == 'iSCSI':
-            do_initialize_connection()
-            iscsi_properties = self._get_iscsi_properties(volume, connector)
+            (device_number, sg_data) = \
+                self.do_initialize_connection(volume, connector)
+            iscsi_properties = self._get_iscsi_properties(
+                volume,
+                connector,
+                device_number,
+                sg_data['raw_output']
+            )
             return {'driver_volume_type': 'iscsi',
                     'data': iscsi_properties}
         elif self.protocol == 'FC':
-            return do_initialize_connection()
+            return self.do_initialize_connection(volume,
+                                                 connector)[0]
 
+    @log_enter_exit
     def terminate_connection(self, volume, connector):
+        """Disallow connection from connector."""
+        self.do_terminate_connection(volume, connector)
+
+    @log_enter_exit
+    def _do_initialize_connection(self, volume, connector):
+        """Initializes the connection and returns connection info."""
+        @lockutils.synchronized('emc-connection-' + connector['host'],
+                                "emc-connection-", True)
+        def inner():
+            return self.assure_host_access(
+                volume, connector)
+        return inner()
+
+    @log_enter_exit
+    def _do_terminate_connection(self, volume, connector):
         """Disallow connection from connector."""
         @lockutils.synchronized('emc-connection-' + connector['host'],
                                 "emc-connection-", True)
         def do_terminate_connection():
             hostname = connector['host']
             volume_name = volume['name']
-            try:
-#                 storage_group_uid = self.get_storage_group_uid(hostname)
-                lun_map = self.get_lun_map(hostname)
-            except EMCVnxCLICmdError as ex:
-                if ex.rc == 83:
-                    LOG.warn(_("Storage Group %s is not found. "
-                             "terminate_connection() is unnecessary. "),
-                             hostname)
-                    return
-            try:
-                lun_id = self.get_lun_id(volume_name)
-            except EMCVnxCLICmdError as ex:
-                if ex.rc == 9:
-                    LOG.warn(_("Volume %s has probably been removed in VNX"),
-                             volume_name)
-                    return
-
-            if lun_id in lun_map:
-                self._client.remove_hlu_from_storagegroup(
-                    lun_map[lun_id], hostname)
+            lun_id = self.get_lun_id(volume)
+            if (hostname in self.hlu_cache and
+                    lun_id in self.hlu_cache[hostname] and not
+                    self.destroy_empty_sg):
+                hlu = self.hlu_cache[hostname][lun_id]
+                self._client.remove_hlu_from_storagegroup(hlu, hostname,
+                                                          poll=True)
+                self.hlu_cache[hostname].pop(lun_id)
+                return False
             else:
-                LOG.warn(_("Volume %(vol)s was not in Storatge Group %(sg)s")
-                         % {'vol': volume_name, 'sg': hostname})
-            if self.destroy_empty_sg:
                 try:
                     lun_map = self.get_lun_map(hostname)
-                    if not lun_map:
-                        LOG.info(_("Storage Group %s was empty"), hostname)
-                        self._client.disconnect_host_from_storage_group(
-                            hostname, hostname)
-                        self._client.delete_storage_group(hostname)
+                    self.hlu_cache[hostname] = lun_map
+                except EMCVnxCLICmdError as ex:
+                    if ex.rc == 83:
+                        LOG.warn(_("Storage Group %s is not found. "
+                                   "terminate_connection() is unnecessary."),
+                                 hostname)
+                        return True
+
+                if lun_id in lun_map:
+                    self._client.remove_hlu_from_storagegroup(
+                        lun_map[lun_id], hostname)
+                    lun_map.pop(lun_id)
+                else:
+                    LOG.warn(_("Volume %(vol)s was not in Storage Group"
+                               " %(sg)s.")
+                             % {'vol': volume_name, 'sg': hostname})
+            if self.destroy_empty_sg and not lun_map:
+                try:
+                    LOG.info(_("Storage Group %s was empty"), hostname)
+                    self._client.disconnect_host_from_storage_group(
+                        hostname, hostname)
+                    self._client.delete_storage_group(hostname)
                 except Exception:
                     LOG.warn(_("Failed to destroy Storage Group %s"),
                              hostname)
+                    try:
+                        self._client.connect_host_to_storage_group(hostname,
+                                                                   hostname)
+                    except Exception:
+                        LOG.warn(_("Connect host back to storage group"
+                                   " failed %s"),
+                                 hostname)
         return do_terminate_connection()
+
+    @log_enter_exit
+    def _do_initialize_connection_in_batch(self, volume, connector):
+        hostname = connector['host']
+        alu = self.get_lun_id(volume)
+        order = {'alu': alu,
+                 'type': BatchOrderType.ADD,
+                 'status': AddHluStatus.NEW,
+                 'tried': 0,
+                 'hlu': None,
+                 'msg': '',
+                 'payload': None}
+        worker = self.get_batch_worker(connector)
+        worker.submit(order)
+        while (order['status'] == AddHluStatus.NEW):
+            LOG.debug("waiting ...........")
+            eventlet.sleep(5)
+        LOG.debug("A add HLU order for %s is processed"
+                  % volume['name'])
+        if order['status'] == AddHluStatus.OK:
+            return order['hlu'], order['payload']
+        elif order['status'] == AddHluStatus.NO_HLU_LEFT:
+            msg = (_('Reach limitation set by configuration '
+                     'option max_luns_per_storage_group. '
+                     'Operation to add %(vol)s into '
+                     'Storage Group %(sg)s is rejected.')
+                   % {'vol': volume['name'], 'sg': hostname})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+        else:
+            msg = (_("Failed to add %(vol)s into %(sg)s ")
+                   % {'vol': volume['name'],
+                      'sg': hostname})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+    @log_enter_exit
+    def _do_terminate_connection_in_batch(self, volume, connector):
+        hostname = connector['host']
+        alu = self.get_lun_id(volume)
+        worker = self.get_batch_worker(connector)
+        order = {'alu': alu,
+                 'type': BatchOrderType.REMOVE,
+                 'status': RemoveHluStatus.NEW,
+                 'tried': 0,
+                 'hlu': None,
+                 'msg': '',
+                 'payload': None}
+        worker.submit(order)
+        while (order['status'] == RemoveHluStatus.NEW):
+            LOG.debug("waiting ...........")
+            eventlet.sleep(5)
+        LOG.debug("Remove HLU order for %s is processed"
+                  % volume['name'])
+        if order['status'] == RemoveHluStatus.OK:
+            return
+        elif (order['status'] == RemoveHluStatus.HLU_NOT_IN_SG):
+            LOG.debug("Volume %(volname)s is not in storagegroup"
+                      " %(sgname)s"
+                      % {'volname': volume['name'],
+                         'sgname': hostname})
+            return
+        else:
+            msg = (_("Failed to remove %(vol)s from %(sg)s ")
+                   % {'vol': volume['name'],
+                      'sg': hostname})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+    def get_batch_worker(self, connector):
+        hostname = connector['host']
+
+        @lockutils.synchronized('emc-get-addhlu-worker' + hostname,
+                                'emc-get-addhlu-worker', False)
+        def get_worker():
+            if hostname not in self.addhlu_workers:
+                self.addhlu_workers[hostname] =\
+                    queueworker.BatchWorkerBase(
+                        self.get_attach_detach_batch_executor(connector),
+                        self.attach_detach_batch_interval)
+            return self.addhlu_workers[hostname]
+        return get_worker()
+
+    def get_attach_detach_batch_executor(self, connector):
+        def executor(orders):
+            hostname = connector['host']
+            sgdata = self._prepare_storage_group(connector)
+            lunmap = sgdata['lunmap']
+            used_hlus = lunmap.values()
+            candidate_hlus = self.filter_available_hlu_set(used_hlus)
+            candidate_hlus = list(candidate_hlus)
+            random.shuffle(candidate_hlus)
+            addhlus = []
+            addalus = []
+            add_ordermap = {}
+            removehlus = []
+            remove_ordermap = {}
+            LOG.debug("Get %s orders" % len(orders))
+            for order in orders:
+                if order['type'] == BatchOrderType.ADD:
+                    alu = order['alu']
+                    if alu in lunmap:
+                        LOG.debug("LUN %s already in SG" % alu)
+                        order['status'] = AddHluStatus.OK
+                        order['hlu'] = lunmap[alu]
+                        order['payload'] = sgdata
+
+                    elif alu in add_ordermap:
+                        LOG.debug("Order for LUN %s already exist" % alu)
+                        add_ordermap[alu]['orders'].append(order)
+
+                    elif len(candidate_hlus) > 0:
+                        addalus.append(alu)
+                        hlu = candidate_hlus.pop()
+                        addhlus.append(hlu)
+                        add_ordermap[alu] = {'orders': [order],
+                                             'hlu': hlu}
+                    else:
+                        # No hlu left
+                        order['status'] = AddHluStatus.NO_HLU_LEFT
+                else:
+                    alu = order['alu']
+                    if alu not in lunmap:
+                        LOG.debug("LUN %(alu)s is not in the storage group")
+                        order['status'] = RemoveHluStatus.HLU_NOT_IN_SG
+                    else:
+                        hlu = lunmap[alu]
+                        if hlu not in remove_ordermap:
+                            removehlus.append(hlu)
+                            remove_ordermap[hlu] = {'orders': [order]}
+                        else:
+                            remove_ordermap[hlu]['orders'].append(order)
+
+            self._process_addhlu_in_batch(addalus, addhlus, hostname,
+                                          add_ordermap, connector,
+                                          sgdata)
+            self._process_removehlu_in_batch(removehlus, hostname,
+                                             remove_ordermap, connector)
+            if self.destroy_empty_sg and not addalus:
+                @lockutils.synchronized('emc-remove-storagegroup-' + hostname,
+                                        'emc-remove-storagegroup-', True)
+                def _delete_empty_storage_group(sgname):
+                    lun_map = self.get_lun_map(sgname)
+                    try:
+                        if not lun_map:
+                            LOG.info(_("Storage Group %s was empty"), sgname)
+                            self._client.disconnect_host_from_storage_group(
+                                sgname, sgname)
+                            self._client.delete_storage_group(sgname)
+                    except Exception:
+                        LOG.warn(_("Failed to destroy Storage Group %s"),
+                                 sgname)
+                        try:
+                            self._client.connect_host_to_storage_group(sgname,
+                                                                       sgname)
+                        except Exception:
+                            LOG.warn(_("Connect host back to storage group"
+                                       " failed %s"),
+                                     sgname)
+                _delete_empty_storage_group(hostname)
+        return executor
+
+    def _prepare_storage_group(self, connector):
+        hostname = connector['host']
+        auto_registration_done = False
+        try:
+            sgdata = self._client.get_storage_group(hostname,
+                                                    poll=True)
+        except EMCVnxCLICmdError as ex:
+            if ex.rc != 83:
+                raise ex
+                # Storage Group has not existed yet
+            self.assure_storage_group(hostname)
+            if self.itor_auto_reg:
+                self.auto_register_initiator(connector, None)
+                auto_registration_done = True
+            else:
+                self._client.connect_host_to_storage_group(hostname,
+                                                           hostname)
+
+            sgdata = self._client.get_storage_group(hostname,
+                                                    poll=True)
+
+        if self.itor_auto_reg and not auto_registration_done:
+            new_registerred = self.auto_register_initiator(connector,
+                                                           sgdata)
+            if new_registerred:
+                sgdata = self._client.get_storage_group(hostname,
+                                                        poll=True)
+        return sgdata
+
+    def _process_addhlu_in_batch(self, alus, hlus, hostname,
+                                 alu_ordermap, connector, sgdata):
+        if len(alus) == 0:
+            return
+
+        (succeed_list, failed_list) = \
+            self._client.add_hlus_to_storage_group(hlus,
+                                                   alus,
+                                                   hostname)
+        for alu in succeed_list:
+            map_item = alu_ordermap.pop(alu)
+            for order in map_item['orders']:
+                order['hlu'] = map_item['hlu']
+                order['status'] = AddHluStatus.OK
+                order['payload'] = sgdata
+
+        worker = self.get_batch_worker(connector)
+        for alu in failed_list:
+            map_item = alu_ordermap.pop(alu)
+            for order in map_item['orders']:
+                if order['tried'] + 1 == self.max_retries:
+                    # Excced Max Retry, mark status to Failure
+                    order['status'] = AddHluStatus.FAILURE
+                else:
+                    order['tried'] = 1 + order['tried']
+                    worker.submit(order)
+
+    def _process_removehlu_in_batch(self, hlus, hostname,
+                                    hlu_ordermap, connector):
+        if len(hlus) == 0:
+            return
+
+        (succeed_list, failed_list) = \
+            self._client.remove_hlus_from_storagegroup(hlus,
+                                                       hostname)
+        for hlu in succeed_list:
+            map_item = hlu_ordermap.pop(hlu)
+            for order in map_item['orders']:
+                order['status'] = RemoveHluStatus.OK
+
+        worker = self.get_batch_worker(connector)
+        for hlu in failed_list:
+            map_item = hlu_ordermap.pop(hlu)
+            for order in map_item['orders']:
+                if order['tried'] + 1 == 2:
+                    # Mark status to Failure in retry
+                    order['status'] = RemoveHluStatus.FAILURE
+                else:
+                    order['tried'] = 1 + order['tried']
+                    worker.submit(order)
 
     def find_iscsi_protocol_endpoints(self, device_sp):
         """Returns the iSCSI initiators for a SP."""
@@ -1763,7 +2150,7 @@ class EMCVnxCliArray(EMCVnxCliBase):
 
     def _update_pool_cache(self):
         LOG.debug(_("Updating Pool Cache"))
-        self.pool_cache = self._client.get_pool_list()
+        self.pool_cache = self._client.get_pool_list(poll=False)
 
     def get_target_storagepool(self, volume, source_volume_name=None):
         """Find the storage pool for given volume."""

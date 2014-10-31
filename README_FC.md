@@ -3,12 +3,15 @@
 Copyright (c) 2012 - 2014 EMC Corporation
 All Rights Reserved
 
-Licensed under EMC Freeware Software License Agreement
-You may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
 
-    https://github.com/emc-openstack/freeware-eula/
-    blob/master/Freeware_EULA_20131217_modified.md
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
 
 ## Overview
 
@@ -20,14 +23,7 @@ The Navisphere CLI (a.k.a. NaviSecCLI) is a Command Line Interface (CLI) used fo
 
 ## Supported OpenStack Release
 
-This driver supports Havana and Icehouse releases. Compared to version in the official OpenStack Github master branch, here are the enhancements:
-
-* Multiple Pools Support
-* Initiator Auto Registration
-* Storage Group Auto Deletion
-* Multiple Authentication Support
-* Storage-Assisted Volume Migration
-* SP Toggle for HA
+This driver supports Havana and Icehouse releases.
 
 ## Requirements
 
@@ -160,6 +156,11 @@ Alternatively, the credentials can be specified in /etc/cinder/cinder.conf by be
         #VNX user type. Valid values are: global, local and ldap. global is the default value
         storage_vnx_authentication_type = ldap
 
+## Restrictions
+
+* It is not suggest to deploy the driver on Nova Compute Node if "cinder upload-to-image --force True" is to be used against an in-use volume. Otherwise, "cinder upload-to-image --force True" will terminate the VM instance's data access to the volume.
+* VNX does not support to extend the thick volume which has snapshot. If user tries to extend a volume which has snapshot, status of the volume would change to "error_extending".
+
 ## Thick/Thin Provisioning
 
 Use Cinder Volume Type to define a provisioning type and the provisioning type could be either thin or thick.
@@ -255,16 +256,17 @@ In following scenarios, VNX native LUN migration will not be triggered:
 
 For more details on multi-backend, see [OpenStack Administration Guide](http://docs.openstack.org/admin-guide-cloud/content/multi_backend.html)
 
-## Restriction of deployment
-
-It is not suggest to deploy the driver on Nova Compute Node if "cinder upload-to-image --force True" is to be used against an in-use volume. Otherwise, "cinder upload-to-image --force True" will terminate the VM instance's data access to the volume.
-
-## Restriction of volume extension
-
-VNX does not support to extend the thick volume which has snapshot. If user tries to extend a volume which has snapshot, status of the volume would change to "error_extending".
-
 ## Initiator Auto Registration
 
-When initiator_auto_registration=True, the driver will automatically register FC initiators to all working FC target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered)
+When `initiator_auto_registration=True`, the driver will automatically register FC initiators to all working FC target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered)
 
 If you want to register some initiators only on some specific ports and don't want them to be registered on other ports, this functionality should be disabled.
+
+## Batch Processing for Volume Attaching/Detaching
+
+Batch Processing is introduced to improve the performance of volume attaching/detaching. The driver accumulates the concurrent attaching/detaching requests and then serves the requests in batch later. Because some duplicated operations will be removed, the whole process will be more efficient. The minimum serving time of a request may increase since time is needed for requests to accumulate but the maximum serving time will be reduced as long as the time for accumulation is not excessively long. Batch processing is disabled by default.
+Option `attach_detach_batch_interval` within the backend section is used to control this support
+
+* `attach_detach_batch_interval=-1`: Batch processing is disabled. This is the default value.
+
+* `attach_detach_batch_interval=<Number of seconds>`: Batch processing is enabled and worker threads will sleep <Number of seconds> for the requests to accumulate before it serve them in batch.

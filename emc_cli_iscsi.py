@@ -1,20 +1,21 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#    Copyright (c) 2012 - 2014 EMC Corporation
-#    All Rights Reserved
+# Copyright (c) 2014 EMC Corporation.
+# All Rights Reserved.
 #
-#    Licensed under EMC Freeware Software License Agreement
-#    You may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
 #
-#        https://github.com/emc-openstack/freeware-eula/
-#        blob/master/Freeware_EULA_20131217_modified.md
+#         http://www.apache.org/licenses/LICENSE-2.0
 #
-
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
 """
 ISCSI Drivers for EMC VNX array based on CLI.
 
 """
-
 from cinder.openstack.common import log as logging
 from cinder.volume import driver
 from cinder.volume.drivers.emc import emc_vnx_cli
@@ -37,15 +38,15 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
 
     def create_volume(self, volume):
         """Creates a EMC(VMAX/VNX) volume."""
-        self.cli.create_volume(volume)
+        return self.cli.create_volume(volume)
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
-        self.cli.create_volume_from_snapshot(volume, snapshot)
+        return self.cli.create_volume_from_snapshot(volume, snapshot)
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates a cloned volume."""
-        self.cli.create_cloned_volume(volume, src_vref)
+        return self.cli.create_cloned_volume(volume, src_vref)
 
     def extend_volume(self, volume, new_size):
         """Extend a volume."""
@@ -72,7 +73,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
 
     def create_export(self, context, volume):
         """Driver entry point to get the export info for a new volume."""
-        self.cli.create_export(context, volume)
+        pass
 
     def remove_export(self, context, volume):
         """Driver entry point to remove an export for a volume."""
