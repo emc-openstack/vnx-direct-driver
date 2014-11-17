@@ -300,4 +300,6 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 * `attach_detach_batch_interval=<Number of seconds>`: Batch processing is enabled and worker threads will sleep <Number of seconds> for the requests to accumulate before it serve them in batch.
 
 ## Multiple iSCSI Target Portals
-When `use_multi_iscsi_portals=True`, Cinder driver can return multiple iSCSI target portals when attach a volume to a virtual machine instance. Nova is able to try alternative portals when multiple target portals returned, thus avoiding failure of single path unavailability. 
+This is an experimental feature before OpenStack supports multiple iSCSI target portals officially. So it is subject to change later when OpenStack community finalizes the solution.
+
+When `use_multi_iscsi_portals=True` is given in the backend configuration, the API `initialize_connection()` can return all available iSCSI target portals as additional fields `target_iqns` and `target_portal` in `connection_info` struture besides existing `target_portal` and `target_iqn` fields. The default value of `use_multi_iscsi_portals` is `False`, which disables the experimental feature.
