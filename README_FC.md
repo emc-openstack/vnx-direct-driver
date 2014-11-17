@@ -111,7 +111,7 @@ Following are the elements specific to VNX CLI driver to be configured
         default_timeout = 10
         volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
         destroy_empty_storage_group = False
-
+        use_multi_iscsi_portals=False
         [database]
         max_pool_size=20
         max_overflow=30
@@ -236,7 +236,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
-
+        use_multi_iscsi_portals=False
         [backendB]
         storage_vnx_pool_name = Pool_02_SAS
         san_ip = 10.10.26.101
@@ -248,7 +248,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
-
+        use_multi_iscsi_portals=False
         [database]
 
         max_pool_size=20
@@ -270,3 +270,6 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 * `attach_detach_batch_interval=-1`: Batch processing is disabled. This is the default value.
 
 * `attach_detach_batch_interval=<Number of seconds>`: Batch processing is enabled and worker threads will sleep <Number of seconds> for the requests to accumulate before it serve them in batch.
+
+## Multiple iSCSI Target Portals
+When `use_multi_iscsi_portals=True`, Cinder driver can return multiple iSCSI target portals when attach a volume to a virtual machine instance. Nova is able to try alternative portals when multiple target portals returned, thus avoiding failure of single path unavailability. 

@@ -135,7 +135,7 @@ Following are the elements specific to VNX CLI driver to be configured
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         iscsi_initiators = {"node1hostname":["10.0.0.1", "10.0.0.2"],"node2hostname":["10.0.0.3"]}
-
+        use_multi_iscsi_portals=False
         [database]
         max_pool_size=20
         max_overflow=30
@@ -184,7 +184,7 @@ Alternatively, the credentials can be specified in /etc/cinder/cinder.conf by be
 ## Restrictions
 
 * It is not suggest to deploy the driver on Nova Compute Node if "cinder upload-to-image --force True" is to be used against an in-use volume. Otherwise, "cinder upload-to-image --force True" will terminate the VM instance's data access to the volume.
-* The VNX drivers caches the iSCSI ports information, so that administrator should restart the cinder service or wait 5 minutes before any volume attachment after changing the iSCSI port configurations. Otherwise, the attachment may failed because old iSCSI port configurations were used.
+* The VNX drivers caches the iSCSI ports information, thus administrator should restart the cinder service or wait 5 minutes before any volume attachment after changing the iSCSI port configurations. Otherwise, the attachment may fail because old iSCSI port configurations were used.
 * VNX does not support to extend the thick volume which has snapshot. If user tries to extend a volume which has snapshot, status of the volume would change to "error_extending".
 
 ## Thick/Thin Provisioning
@@ -263,7 +263,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
-
+        use_multi_iscsi_portals=False
         [backendB]
         storage_vnx_pool_name = Pool_02_SAS
         san_ip = 10.10.26.101
@@ -275,7 +275,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
-
+        use_multi_iscsi_portals=False
         [database]
 
         max_pool_size=20
@@ -298,3 +298,6 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 * `attach_detach_batch_interval=-1`: Batch processing is disabled. This is the default value.
 
 * `attach_detach_batch_interval=<Number of seconds>`: Batch processing is enabled and worker threads will sleep <Number of seconds> for the requests to accumulate before it serve them in batch.
+
+## Multiple iSCSI Target Portals
+When `use_multi_iscsi_portals=True`, Cinder driver can return multiple iSCSI target portals when attach a volume to a virtual machine instance. Nova is able to try alternative portals when multiple target portals returned, thus avoiding failure of single path unavailability. 

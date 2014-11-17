@@ -16,11 +16,16 @@ import eventlet
 from eventlet import greenthread
 from eventlet import queue
 
+from cinder.openstack.common import log as logging
+
+LOG = logging.getLogger(__name__)
+
 
 class Status(object):
     NEW = 1
     OK = 0
     FAILURE = -1
+    ABANDON = 2
 
 
 class BatchWorkerBase(object):
@@ -50,6 +55,6 @@ class BatchWorkerBase(object):
                 if len(orders) > 0:
                     self.executor(orders)
             except Exception as ex:
-                print("execute exception %s" % ex)
+                LOG.debug("Execute exception %s" % ex)
             finally:
                 eventlet.sleep(self.sleep_interval)

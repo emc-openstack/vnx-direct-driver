@@ -43,7 +43,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.02'
+VERSION = '03.00.03'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -95,6 +95,9 @@ loc_opts = [
                help='Interval by seconds between the '
                'attach detach work. Set it to -1 will disable'
                'the batch feature'),
+    cfg.BoolOpt('use_multi_iscsi_portals',
+                default=False,
+                help="Return multiple iSCSI target portals")
 ]
 
 CONF.register_opts(loc_opts)
@@ -136,7 +139,6 @@ class EMCVnxCLICmdError(exception.VolumeBackendAPIException):
              'out': out.split('\n')}
         kwargs["data"] = msg
         super(EMCVnxCLICmdError, self).__init__(**kwargs)
-        LOG.error(msg)
 
 
 class PropertyDescriptor(object):
@@ -275,7 +277,7 @@ class CommandLineHelper(object):
                               '-name', name]
 
         # executing cli command to create volume
-        out, rc = self.command_execute(*command_create_lun)
+        out, rc = self.command_execute(*command_create_lun, poll=False)
         if rc != 0:
             #Ignore the error that due to retry
             if rc == 4 and out.find('(0x712d8d04)') >= 0:
@@ -327,8 +329,14 @@ class CommandLineHelper(object):
         self.create_lun(poolname, name, size, thinness)
 
         def lun_is_ready():
-            data = self.get_lun_by_name(name)
-            return data[self.LUN_STATE.key] == 'Ready'
+            try:
+                data = self.get_lun_by_name(name, poll=False)
+                return data[self.LUN_STATE.key] == 'Ready'
+            except EMCVnxCLICmdError as ex:
+                if ex.out.find('The (pool lun) may not exist') >= 0:
+                    return False
+                else:
+                    raise ex
 
         timer = loopingcall.FixedIntervalLoopingCall(
             self._wait_for_a_condition,
@@ -375,7 +383,8 @@ class CommandLineHelper(object):
                                        '-allowReadWrite', 'yes',
                                        '-allowAutoDelete', 'no')
 
-            out, rc = self.command_execute(*command_create_snapshot)
+            out, rc = self.command_execute(*command_create_snapshot,
+                                           poll=False)
             if rc != 0:
                 #Ignore the error that due to retry
                 if rc == 5 and \
@@ -1083,11 +1092,10 @@ class CommandLineHelper(object):
             # Active IP is inaccessible, and cannot toggle to another SP,
             # return Error
             out, rc = "Server Unavailable", 255
-
-        LOG.debug('EMC: Command: %(command)s.'
-                  % {'command': self.command + command})
-        LOG.debug('EMC: Command Result: %(result)s.' %
-                  {'result': out.replace('\n', '\\n')})
+            LOG.debug('EMC: Command: %(command)s. Result: '
+                      'Server Unavailable. Command is not executed '
+                      'because SPs are inaccessible.' %
+                      {'command': self.command + command})
 
         return out, rc
 
@@ -1112,6 +1120,11 @@ class CommandLineHelper(object):
             rc = pe.exit_code
             out = pe.stdout
             out = out.replace('\n', '\\n')
+
+        LOG.debug('EMC: Command: %(command)s. Result: %(result)s.'
+                  % {'command': self.command + active_ip + command,
+                     'result': out.replace('\n', '\\n')})
+
         return out, rc
 
     def _is_sp_alive(self, ipaddr):
@@ -1166,6 +1179,7 @@ class EMCVnxCliBase(object):
         self.max_luns_per_sg = self.configuration.max_luns_per_storage_group
         self.destroy_empty_sg = self.configuration.destroy_empty_storage_group
         self.itor_auto_reg = self.configuration.initiator_auto_registration
+        self.multi_portals = self.configuration.use_multi_iscsi_portals
         self.max_retries = 5
         self.attach_detach_batch_interval = \
             self.configuration.attach_detach_batch_interval
@@ -1708,15 +1722,16 @@ class EMCVnxCliBase(object):
             connector['initiator'],
             storage_group,
             sg_raw_output)
-        target = self._client.find_avaialable_iscsi_target_one(
-            storage_group, owner_sp,
-            registered_spports,
-            self.iscsi_targets)
         properties = {'target_discovered': True,
                       'target_iqn': 'unknown',
                       'target_portal': 'unknown',
                       'target_lun': 'unknown',
                       'volume_id': volume['id']}
+        target = self._client.find_avaialable_iscsi_target_one(
+            storage_group, owner_sp,
+            registered_spports,
+            self.iscsi_targets)
+
         if target:
             properties = {'target_discovered': True,
                           'target_iqn': target['Port WWN'],
@@ -1732,6 +1747,15 @@ class EMCVnxCliBase(object):
         else:
             LOG.error(_('Failed to find an available iSCSI targets for %s.'),
                       storage_group)
+        if self.multi_portals:
+            portals = []
+            iqns = []
+            for sp in ('A', 'B'):
+                for one_target in self.iscsi_targets[sp]:
+                    portals.append("%s:3260" % one_target['IP Address'])
+                    iqns.append(one_target['Port WWN'])
+            properties['target_iqns'] = iqns
+            properties['target_portals'] = portals
 
         return properties
 
@@ -1851,6 +1875,13 @@ class EMCVnxCliBase(object):
                    % {'vol': volume['name'], 'sg': hostname})
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
+        elif order['status'] == AddHluStatus.ABANDON:
+            msg = (_("Didn't add %(vol)s into %(sg)s because there is "
+                     "new request to remove %(vol)s from %(sg)s")
+                   % {'vol': volume['name'],
+                      'sg': hostname})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
         else:
             msg = (_("Failed to add %(vol)s into %(sg)s ")
                    % {'vol': volume['name'],
@@ -1884,6 +1915,13 @@ class EMCVnxCliBase(object):
                       % {'volname': volume['name'],
                          'sgname': hostname})
             return
+        elif order['status'] == RemoveHluStatus.ABANDON:
+            msg = (_("Didn't remove %(vol)s from %(sg)s because there is "
+                     "new request to add %(vol)s into %(sg)s")
+                   % {'vol': volume['name'],
+                      'sg': hostname})
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
         else:
             msg = (_("Failed to remove %(vol)s from %(sg)s ")
                    % {'vol': volume['name'],
@@ -1908,7 +1946,14 @@ class EMCVnxCliBase(object):
     def get_attach_detach_batch_executor(self, connector):
         def executor(orders):
             hostname = connector['host']
-            sgdata = self._prepare_storage_group(connector)
+            try:
+                sgdata = self._prepare_storage_group(connector)
+            except Exception as ex:
+                LOG.error("Failed to prepare storage group. %s" % ex)
+                for order in orders:
+                    order['status'] = queueworker.Status.FAILURE
+                return
+
             lunmap = sgdata['lunmap']
             used_hlus = lunmap.values()
             candidate_hlus = self.filter_available_hlu_set(used_hlus)
@@ -1919,41 +1964,54 @@ class EMCVnxCliBase(object):
             add_ordermap = {}
             removehlus = []
             remove_ordermap = {}
+            effective_ordermap = {}
             LOG.debug("Get %s orders" % len(orders))
             for order in orders:
+                alu = order['alu']
+                if alu not in effective_ordermap:
+                    effective_ordermap[alu] = [order]
+                elif order['type'] == effective_ordermap[alu][0]['type']:
+                    # Duplicated orders which may happen in the retry
+                    effective_ordermap[alu].append(order)
+                else:
+                    # This may happen when there is rollback after timeout
+                    LOG.debug("There is different order type for a same "
+                              "alu, the orders in old type will be abandon")
+                    for item in effective_ordermap[alu]:
+                        item['status'] = queueworker.Status.ABANDON
+
+                    effective_ordermap[alu] = [order]
+
+            for alu in effective_ordermap:
+                orders = effective_ordermap[alu]
+                order = orders[0]
                 if order['type'] == BatchOrderType.ADD:
-                    alu = order['alu']
                     if alu in lunmap:
                         LOG.debug("LUN %s already in SG" % alu)
-                        order['status'] = AddHluStatus.OK
-                        order['hlu'] = lunmap[alu]
-                        order['payload'] = sgdata
+                        for order in orders:
+                            order['status'] = AddHluStatus.OK
+                            order['hlu'] = lunmap[alu]
+                            order['payload'] = sgdata
 
-                    elif alu in add_ordermap:
-                        LOG.debug("Order for LUN %s already exist" % alu)
-                        add_ordermap[alu]['orders'].append(order)
-
-                    elif len(candidate_hlus) > 0:
+                    elif candidate_hlus:
                         addalus.append(alu)
                         hlu = candidate_hlus.pop()
                         addhlus.append(hlu)
-                        add_ordermap[alu] = {'orders': [order],
+                        add_ordermap[alu] = {'orders': orders,
                                              'hlu': hlu}
                     else:
                         # No hlu left
-                        order['status'] = AddHluStatus.NO_HLU_LEFT
+                        for order in orders:
+                            order['status'] = AddHluStatus.NO_HLU_LEFT
                 else:
-                    alu = order['alu']
                     if alu not in lunmap:
                         LOG.debug("LUN %(alu)s is not in the storage group")
-                        order['status'] = RemoveHluStatus.HLU_NOT_IN_SG
+                        for order in orders:
+                            order['status'] = RemoveHluStatus.HLU_NOT_IN_SG
                     else:
                         hlu = lunmap[alu]
-                        if hlu not in remove_ordermap:
-                            removehlus.append(hlu)
-                            remove_ordermap[hlu] = {'orders': [order]}
-                        else:
-                            remove_ordermap[hlu]['orders'].append(order)
+                        removehlus.append(hlu)
+                        remove_ordermap[hlu] = {'orders': orders}
 
             self._process_addhlu_in_batch(addalus, addhlus, hostname,
                                           add_ordermap, connector,
@@ -2033,7 +2091,7 @@ class EMCVnxCliBase(object):
         for alu in failed_list:
             map_item = alu_ordermap.pop(alu)
             for order in map_item['orders']:
-                if order['tried'] + 1 == self.max_retries:
+                if order['tried'] + 1 >= self.max_retries:
                     # Excced Max Retry, mark status to Failure
                     order['status'] = AddHluStatus.FAILURE
                 else:
@@ -2057,7 +2115,7 @@ class EMCVnxCliBase(object):
         for hlu in failed_list:
             map_item = hlu_ordermap.pop(hlu)
             for order in map_item['orders']:
-                if order['tried'] + 1 == 2:
+                if order['tried'] + 1 >= 2:
                     # Mark status to Failure in retry
                     order['status'] = RemoveHluStatus.FAILURE
                 else:
