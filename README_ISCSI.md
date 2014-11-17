@@ -302,4 +302,4 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 ## Multiple iSCSI Target Portals
 This is an experimental feature before OpenStack supports multiple iSCSI target portals officially. So it is subject to change later when OpenStack community finalizes the solution.
 
-When `use_multi_iscsi_portals=True` is given in the backend configuration, the API `initialize_connection()` can return all available iSCSI target portals as additional fields `target_iqns` and `target_portal` in `connection_info` struture besides existing `target_portal` and `target_iqn` fields. The default value of `use_multi_iscsi_portals` is `False`, which disables the experimental feature.
+When `use_multi_iscsi_portals=True` is given in the backend configuration, the API `initialize_connection()` can return all available iSCSI target portals as additional fields `target_iqns` and `target_portals` in `connection_info` struture besides existing `target_portal` and `target_iqn` fields. The default value of `use_multi_iscsi_portals` is `False`, which disables the experimental feature.
