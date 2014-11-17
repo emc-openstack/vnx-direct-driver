@@ -60,12 +60,13 @@ Navisphere CLI needs to be installed in all the Cinder nodes in an OpenStack dep
 
 ### Install Cinder driver
 
-EMC VNX FC Direct Driver provided in the installer package consists of two python files:
+EMC VNX FC Direct Driver provided in the installer package consists of three python files:
 
-		emc_vnx_cli.py
-		emc_cli_fc.py
-                                
-Copy the above two files to the `cinder/volume/drivers/emc/` directory of your OpenStack node(s) where cinder-volume is running.
+        emc_vnx_cli.py
+        emc_cli_fc.py
+        queueworker.py
+
+Copy the above files to the `cinder/volume/drivers/emc/` directory of your OpenStack node(s) where cinder-volume is running.
 
 ### FC Zoning with VNX
 FC Zoning should be done between OpenStack node(s) and VNX.
