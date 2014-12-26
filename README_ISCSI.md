@@ -304,3 +304,11 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 This is an experimental feature before OpenStack supports multiple iSCSI target portals officially. So it is subject to change later when OpenStack community finalizes the solution.
 
 When `use_multi_iscsi_portals=True` is given in the backend configuration, the API `initialize_connection()` can return all available iSCSI target portals as additional fields `target_iqns` and `target_portals` in `connection_info` struture besides existing `target_portal` and `target_iqn` fields. The default value of `use_multi_iscsi_portals` is `False`, which disables the experimental feature.
+
+## Force Delete LUNs in Storage Groups
+
+Some LUNs corresponding to some `available` volumes may remain in some Storage Groups in VNX array side due to some OpenStack timeout issue. But VNX arrays do not allow users to delete LUNs still in some Storage Groups. `force_delete_lun_in_storagegroup` is introduced to allow users to delete the `available` volumes in this tricky situation.
+
+When `force_delete_lun_in_storagegroup=True` in the backend section, the driver will move the LUN out of Storage Groups and then delete the LUN if the user try to delete some volume whose corresponding LUN remains in some Storage Groups in the VNX array.
+
+The default value of `force_delete_lun_in_storagegroup` is `False`.

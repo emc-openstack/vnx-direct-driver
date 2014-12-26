@@ -29,6 +29,7 @@ except ImportError:
 from oslo.config import cfg
 
 from cinder import exception
+from cinder.openstack.common import excutils
 from cinder.openstack.common import lockutils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import loopingcall
@@ -43,7 +44,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.03'
+VERSION = '03.00.04'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -97,7 +98,10 @@ loc_opts = [
                'the batch feature'),
     cfg.BoolOpt('use_multi_iscsi_portals',
                 default=False,
-                help="Return multiple iSCSI target portals")
+                help="Return multiple iSCSI target portals"),
+    cfg.BoolOpt('force_delete_lun_in_storagegroup',
+                default=False,
+                help='Delete a LUN even if it is in Storage Groups'),
 ]
 
 CONF.register_opts(loc_opts)
@@ -294,7 +298,7 @@ class CommandLineHelper(object):
                               '-o']
         # executing cli command to delete volume
         out, rc = self.command_execute(*command_delete_lun)
-        if rc != 0:
+        if rc != 0 or out.strip():
             #Ignore the error that due to retry
             if rc == 9 and out.find("not exist") >= 0:
                 LOG.warn(_("LUN already deleted, LUN name %(name)s. "
@@ -597,6 +601,29 @@ class CommandLineHelper(object):
                 lun_map[int(key)] = int(value)
 
         return data
+
+    def get_hlus(self, lun_id, poll=True):
+        hlus = list()
+        command_storage_group_list = ('storagegroup', '-list')
+        out, rc = self.command_execute(*command_storage_group_list,
+                                       poll=poll)
+        if rc != 0:
+            raise EMCVnxCLICmdError(command_storage_group_list, rc, out)
+        sg_name_p = re.compile(r'^\s*(?P<sg_name>[^\n\r]+)')
+        hlu_alu_p = re.compile(r'HLU/ALU Pairs:'
+                               r'\s*HLU Number\s*ALU Number'
+                               r'\s*[-\s]*'
+                               r'(\d|\s)*'
+                               r'\s+(?P<hlu>\d+)( |\t)+%s' % lun_id)
+        for sg_info in out.split('Storage Group Name:'):
+            hlu_alu_m = hlu_alu_p.search(sg_info)
+            if hlu_alu_m is None:
+                continue
+            sg_name_m = sg_name_p.search(sg_info)
+            if sg_name_m:
+                hlus.append((hlu_alu_m.group('hlu'),
+                             sg_name_m.group('sg_name')))
+        return hlus
 
     def create_storage_group(self, name):
 
@@ -1203,6 +1230,10 @@ class EMCVnxCliBase(object):
                 self._do_initialize_connection_in_batch
             self.do_terminate_connection =\
                 self._do_terminate_connection_in_batch
+        self.force_delete_lun_in_sg = \
+            self.configuration.force_delete_lun_in_storagegroup
+        if self.force_delete_lun_in_sg:
+            LOG.warn(_("force_delete_lun_in_storagegroup=True"))
 
     def get_target_storagepool(self, volume, source_volume_name=None):
         raise NotImplementedError
@@ -1218,7 +1249,6 @@ class EMCVnxCliBase(object):
     @log_enter_exit
     def create_volume(self, volume):
         """Creates a EMC volume."""
-        LOG.debug(_('Entering create_volume.'))
         volumesize = volume['size']
         volumename = volume['name']
 
@@ -1245,14 +1275,29 @@ class EMCVnxCliBase(object):
     def delete_volume(self, volume):
         """Deletes an EMC volume."""
 
-        LOG.debug(_('Entering delete_volume.'))
-        self._client.delete_lun(volume['name'])
+        try:
+            self._client.delete_lun(volume['name'])
+        except EMCVnxCLICmdError as ex:
+            if (self.force_delete_lun_in_sg and
+                    ('contained in a Storage Group' in ex.out or
+                     'Host LUN/LUN mapping still exists' in ex.out)):
+                LOG.warn(_('LUN corresponding to %s is still '
+                           'in some Storage Groups.'
+                           'Try to bring the LUN out of Storage Groups '
+                           'and retry the deletion.'),
+                         volume['name'])
+                lun_id = self.get_lun_id(volume)
+                for hlu, sg in self._client.get_hlus(lun_id):
+                    self._client.remove_hlu_from_storagegroup(hlu, sg)
+                self._client.delete_lun(volume['name'])
+            else:
+                with excutils.save_and_reraise_exception():
+                    # Reraise the original exceiption
+                    pass
 
     @log_enter_exit
     def extend_volume(self, volume, new_size):
         """Extends an EMC volume."""
-
-        LOG.debug(_('Entering extend_volume.'))
 
         self._client.expand_lun_and_wait(volume['name'], new_size)
 
@@ -1312,7 +1357,6 @@ class EMCVnxCliBase(object):
     @log_enter_exit
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
-        LOG.debug(_('Entering create_snapshot.'))
 
         snapshotname = snapshot['name']
         volumename = snapshot['volume_name']
@@ -1326,7 +1370,6 @@ class EMCVnxCliBase(object):
     @log_enter_exit
     def delete_snapshot(self, snapshot):
         """Deletes a snapshot."""
-        LOG.debug(_('Entering delete_snapshot.'))
 
         snapshotname = snapshot['name']
 
@@ -1338,7 +1381,7 @@ class EMCVnxCliBase(object):
     @log_enter_exit
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
-        LOG.debug(_('Entering create_volume_from_snapshot.'))
+
         snapshot_name = snapshot['name']
         source_volume_name = snapshot['volume_name']
         volume_name = volume['name']

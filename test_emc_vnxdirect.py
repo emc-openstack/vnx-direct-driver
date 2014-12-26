@@ -76,6 +76,31 @@ class EMCVNXCLIDriverTestData():
         'display_name': 'failed_vol',
         'display_description': 'test failed volume',
         'volume_type_id': None}
+
+    test_volume1_in_sg = {
+        'name': 'vol1_in_sg',
+        'size': 1,
+        'volume_name': 'vol1_in_sg',
+        'id': '4',
+        'provider_auth': None,
+        'project_id': 'project',
+        'display_name': 'failed_vol',
+        'display_description': 'Volume 1 in SG',
+        'volume_type_id': None,
+        'provider_location': 'system^fakesn|type^lun|id^4'}
+
+    test_volume2_in_sg = {
+        'name': 'vol2_in_sg',
+        'size': 1,
+        'volume_name': 'vol2_in_sg',
+        'id': '5',
+        'provider_auth': None,
+        'project_id': 'project',
+        'display_name': 'failed_vol',
+        'display_description': 'Volume 2 in SG',
+        'volume_type_id': None,
+        'provider_location': 'system^fakesn|type^lun|id^3'}
+
     test_snapshot = {
         'name': 'snapshot1',
         'size': 1,
@@ -162,6 +187,16 @@ class EMCVNXCLIDriverTestData():
     def CONNECTHOST_CMD(self, hostname, gname):
         return ('storagegroup', '-connecthost',
                 '-host', hostname, '-gname', gname, '-o')
+
+    def STORAGEGROUP_LIST_CMD(self, gname=None):
+        if gname:
+            return ('storagegroup', '-list', '-gname', gname)
+        else:
+            return ('storagegroup', '-list')
+
+    def STORAGEGROUP_REMOVEHLU_CMD(self, gname, hlu):
+        return ('storagegroup', '-removehlu',
+                '-hlu', hlu, '-gname', gname, '-o')
 
     POOL_PROPERTY = ("""\
 Pool Name:  unit_test_pool
@@ -300,6 +335,61 @@ Available Capacity (GBs):  1000.6
             4               4
         Shareable:             YES""" % sgname, 0)
 
+    def STORAGE_GROUPS_HAS_MAP(self, sgname1, sgname2):
+
+        return ("""
+
+        Storage Group Name:    irrelative
+        Storage Group UID:     9C:86:4F:30:07:76:E4:11:AC:83:C8:C0:8E:9C:D6:1F
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:5741c6307e60            SP A         6
+
+        Storage Group Name:    %(sgname1)s
+        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:222                     SP A         4
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            31              3
+            41              4
+        Shareable:             YES
+
+        Storage Group Name:    %(sgname2)s
+        Storage Group UID:     9C:86:4F:30:07:76:E4:11:AC:83:C8:C0:8E:9C:D6:1F
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:5741c6307e60            SP A         6
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            32              3
+            42              4
+        Shareable:             YES""" % {'sgname1': sgname1,
+                                         'sgname2': sgname2}, 0)
+
+    def LUN_DELETE_IN_SG_ERROR(self, up_to_date=True):
+        if up_to_date:
+            return ("Cannot unbind LUN "
+                    "because it's contained in a Storage Group",
+                    156)
+        else:
+            return ("SP B: Request failed.  "
+                    "Host LUN/LUN mapping still exists.",
+                    0)
+
 
 class DriverTestCaseBase(test.TestCase):
     def setUp(self):
@@ -330,6 +420,7 @@ class DriverTestCaseBase(test.TestCase):
         #set the timeout to 0.012s = 0.0002 * 60 = 1.2ms
         self.configuration.default_timeout = 0.0002
         self.configuration.initiator_auto_registration = True
+        self.configuration.force_delete_lun_in_storagegroup = False
         self.stubs.Set(self.configuration, 'safe_get', self.fake_safe_get)
         self.testData = EMCVNXCLIDriverTestData()
         self.navisecclicmd = '/opt/Navisphere/bin/naviseccli ' + \
@@ -795,6 +886,63 @@ Time Remaining:  0 second(s)
         expected = [mock.call(*self.testData.LUN_DELETE_CMD('failed_vol1'))]
         fake_cli.assert_has_calls(expected)
 
+    def test_delete_volume_in_sg_failed(self):
+        commands = [self.testData.LUN_DELETE_CMD('vol1_in_sg'),
+                    self.testData.LUN_DELETE_CMD('vol2_in_sg')]
+        results = [self.testData.LUN_DELETE_IN_SG_ERROR(),
+                   self.testData.LUN_DELETE_IN_SG_ERROR(False)]
+        fake_cli = self.driverSetup(commands, results)
+        self.assertRaises(EMCVnxCLICmdError,
+                          self.driver.delete_volume,
+                          self.testData.test_volume1_in_sg)
+        self.assertRaises(EMCVnxCLICmdError,
+                          self.driver.delete_volume,
+                          self.testData.test_volume2_in_sg)
+
+    def test_delete_volume_in_sg_force(self):
+        commands = [self.testData.LUN_DELETE_CMD('vol1_in_sg'),
+                    self.testData.STORAGEGROUP_LIST_CMD(),
+                    self.testData.STORAGEGROUP_REMOVEHLU_CMD('fakehost1',
+                                                             '41'),
+                    self.testData.STORAGEGROUP_REMOVEHLU_CMD('fakehost1',
+                                                             '42'),
+                    self.testData.LUN_DELETE_CMD('vol2_in_sg'),
+                    self.testData.STORAGEGROUP_REMOVEHLU_CMD('fakehost2',
+                                                             '31'),
+                    self.testData.STORAGEGROUP_REMOVEHLU_CMD('fakehost2',
+                                                             '32')]
+        results = [[self.testData.LUN_DELETE_IN_SG_ERROR(),
+                    SUCCEED],
+                   self.testData.STORAGE_GROUPS_HAS_MAP('fakehost1',
+                                                        'fakehost2'),
+                   SUCCEED,
+                   SUCCEED,
+                   [self.testData.LUN_DELETE_IN_SG_ERROR(False),
+                    SUCCEED],
+                   SUCCEED,
+                   SUCCEED]
+        fake_cli = self.driverSetup(commands, results)
+        self.driver.cli.force_delete_lun_in_sg = True
+        self.driver.delete_volume(self.testData.test_volume1_in_sg)
+        self.driver.delete_volume(self.testData.test_volume2_in_sg)
+        expected = [mock.call(*self.testData.LUN_DELETE_CMD('vol1_in_sg')),
+                    mock.call(*self.testData.STORAGEGROUP_LIST_CMD(),
+                              poll=True),
+                    mock.call(*self.testData.STORAGEGROUP_REMOVEHLU_CMD(
+                        'fakehost1', '41'), poll=False),
+                    mock.call(*self.testData.STORAGEGROUP_REMOVEHLU_CMD(
+                        'fakehost2', '42'), poll=False),
+                    mock.call(*self.testData.LUN_DELETE_CMD('vol1_in_sg')),
+                    mock.call(*self.testData.LUN_DELETE_CMD('vol2_in_sg')),
+                    mock.call(*self.testData.STORAGEGROUP_LIST_CMD(),
+                              poll=True),
+                    mock.call(*self.testData.STORAGEGROUP_REMOVEHLU_CMD(
+                        'fakehost1', '31'), poll=False),
+                    mock.call(*self.testData.STORAGEGROUP_REMOVEHLU_CMD(
+                        'fakehost2', '32'), poll=False),
+                    mock.call(*self.testData.LUN_DELETE_CMD('vol2_in_sg'))]
+        fake_cli.assert_has_calls(expected)
+
     def test_extend_volume(self):
         commands = [self.testData.LUN_PROPERTY_ALL_CMD('vol1')]
         results = [self.testData.LUN_PROPERTY('vol1', size=2)]
@@ -887,6 +1035,7 @@ class EMCVNXCLIToggleSPTestCase(test.TestCase):
     def setUp(self):
         #backup
         super(EMCVNXCLIToggleSPTestCase, self).setUp()
+        self.stubs.Set(os.path, 'exists', mock.Mock(return_value=1))
         self.configuration = mock.Mock(conf.Configuration)
         self.configuration.naviseccli_path = '/opt/Navisphere/bin/naviseccli'
         self.configuration.san_ip = '10.10.10.10'

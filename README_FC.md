@@ -268,3 +268,11 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 * `attach_detach_batch_interval=-1`: Batch processing is disabled. This is the default value.
 
 * `attach_detach_batch_interval=<Number of seconds>`: Batch processing is enabled and worker threads will sleep <Number of seconds> for the requests to accumulate before it serve them in batch.
+
+## Force Delete LUNs in Storage Groups
+
+Some LUNs corresponding to some `available` volumes may remain in some Storage Groups in VNX array side due to some OpenStack timeout issue. But VNX arrays do not allow users to delete LUNs still in some Storage Groups. `force_delete_lun_in_storagegroup` is introduced to allow users to delete the `available` volumes in this tricky situation.
+
+When `force_delete_lun_in_storagegroup=True` in the backend section, the driver will move the LUN out of Storage Groups and then delete the LUN if the user try to delete some volume whose corresponding LUN remains in some Storage Groups in the VNX array.
+
+The default value of `force_delete_lun_in_storagegroup` is `False`.
