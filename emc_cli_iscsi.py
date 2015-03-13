@@ -1,4 +1,4 @@
-# Copyright (c) 2014 EMC Corporation.
+# Copyright (c) 2012 - 2015 EMC Corporation, Inc.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,9 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 """
-ISCSI Drivers for EMC VNX array based on CLI.
+iSCSI Drivers for EMC VNX array based on CLI.
 
 """
+
 from cinder.openstack.common import log as logging
 from cinder.volume import driver
 from cinder.volume.drivers.emc import emc_vnx_cli
@@ -24,7 +25,22 @@ LOG = logging.getLogger(__name__)
 
 
 class EMCCLIISCSIDriver(driver.ISCSIDriver):
-    """EMC ISCSI Drivers for VNX using CLI."""
+    """EMC ISCSI Drivers for VNX using CLI.
+
+    New Features in 4.*.*:
+        4.0.0 - Advanced LUN Features (Compression Support,
+                Deduplication Support, FAST VP Support,
+                FAST Cache Support), Storage-assisted Retype,
+                External Volume Management, Read-only Volume,
+                FC Auto Zoning
+        4.1.0 - Consistency group support
+        4.2.0 - Performance enhancement, LUN Number Threshold Support,
+                Initiator Auto Deregistration,
+                Force Deleting LUN in Storage Groups,
+                robust enhancement,
+                Pool-aware scheduler support,
+                Batch processing for volume attach/detach
+    """
 
     def __init__(self, *args, **kwargs):
 
@@ -32,12 +48,13 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
         self.cli = emc_vnx_cli.getEMCVnxCli(
             'iSCSI',
             configuration=self.configuration)
+        self.VERSION = self.cli.VERSION
 
     def check_for_setup_error(self):
         pass
 
     def create_volume(self, volume):
-        """Creates a EMC(VMAX/VNX) volume."""
+        """Creates a VNX volume."""
         return self.cli.create_volume(volume)
 
     def create_volume_from_snapshot(self, volume, snapshot):
@@ -53,11 +70,15 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
         self.cli.extend_volume(volume, new_size)
 
     def delete_volume(self, volume):
-        """Deletes an EMC volume."""
+        """Deletes a VNX volume."""
         self.cli.delete_volume(volume)
 
     def migrate_volume(self, ctxt, volume, host):
         return self.cli.migrate_volume(ctxt, volume, host)
+
+    def retype(self, ctxt, volume, new_type, diff, host):
+        """Convert the volume to be of the new type."""
+        return self.cli.retype(ctxt, volume, new_type, diff, host)
 
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
@@ -87,7 +108,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
         """Initializes the connection and returns connection info.
 
         The iscsi driver returns a driver_volume_type of 'iscsi'.
-        the format of the driver data is defined in _get_iscsi_properties.
+        the format of the driver data is defined in vnx_get_iscsi_properties.
         Example return value::
 
             {
@@ -96,7 +117,8 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                     'target_discovered': True,
                     'target_iqn': 'iqn.2010-10.org.openstack:volume-00000001',
                     'target_portal': '127.0.0.0.1:3260',
-                    'volume_id': 1,
+                    'target_lun': 1,
+                    'access_mode': 'rw'
                 }
             }
 
@@ -113,18 +135,61 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
         If 'refresh' is True, run update the stats first.
         """
         if refresh:
-            self.update_volume_status()
+            self.update_volume_stats()
 
         return self._stats
 
-    def update_volume_status(self):
+    def update_volume_stats(self):
         """Retrieve status info from volume group."""
-        LOG.debug(_("Updating volume status"))
-        #retrieving the volume update from the VNX
-        data = self.cli.update_volume_status()
+        LOG.debug("Updating volume status.")
+        # retrieving the volume update from the VNX
+        data = self.cli.update_volume_stats()
 
         backend_name = self.configuration.safe_get('volume_backend_name')
         data['volume_backend_name'] = backend_name or 'EMCCLIISCSIDriver'
         data['storage_protocol'] = 'iSCSI'
 
         self._stats = data
+
+    def manage_existing(self, volume, existing_ref):
+        """Manage an existing lun in the array.
+
+        The lun should be in a manageable pool backend, otherwise
+        error would return.
+        Rename the backend storage object so that it matches the,
+        volume['name'] which is how drivers traditionally map between a
+        cinder volume and the associated backend storage object.
+
+        existing_ref:{
+            'id':lun_id
+        }
+        """
+        LOG.debug("Reference lun id %s." % existing_ref['id'])
+        self.cli.manage_existing(volume, existing_ref)
+
+    def manage_existing_get_size(self, volume, existing_ref):
+        """Return size of volume to be managed by manage_existing.
+        """
+        return self.cli.manage_existing_get_size(volume, existing_ref)
+
+    def create_consistencygroup(self, context, group):
+        """Creates a consistencygroup."""
+        return self.cli.create_consistencygroup(context, group)
+
+    def delete_consistencygroup(self, context, group):
+        """Deletes a consistency group."""
+        return self.cli.delete_consistencygroup(
+            self, context, group)
+
+    def create_cgsnapshot(self, context, cgsnapshot):
+        """Creates a cgsnapshot."""
+        return self.cli.create_cgsnapshot(
+            self, context, cgsnapshot)
+
+    def delete_cgsnapshot(self, context, cgsnapshot):
+        """Deletes a cgsnapshot."""
+        return self.cli.delete_cgsnapshot(self, context, cgsnapshot)
+
+    def get_pool(self, volume):
+        """Returns the pool name of a volume."""
+        return self.cli.get_pool(volume)

@@ -21,5 +21,15 @@ See `README_ISCSI.md` and `README_FC.md` for detailed information.
 
 ## Driver Repositories
 
-* Latest Driver for Juno: [OpenStack Github](https://github.com/openstack/cinder/tree/stable/juno/cinder/volume/drivers/emc)
-* Latest Driver for Icehouse: [EMC Github](https://github.com/emc-openstack/vnx-direct-driver)
+* The first release of the driver for a specific OpenStack release will
+be available in the corresponding branch of
+[OpenStack Official Github](https://github.com/openstack/cinder) along
+with the GA of the OpenStack release.
+* If a following update of the driver for the same OpenStack release is
+published, the branch of
+[EMC Github](https://github.com/emc-openstack/vnx-direct-driver) will be used
+and the version tag (the middle version number or the minor version number will
+be increased and the major version number is the same as the one in OpenStack
+Official Github) will be added.
+* The supported OpenStack release of the driver in EMC Github will be
+explicitly stated in the corresponding `README_ISCSI.md` and `README_FC.md`.
