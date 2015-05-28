@@ -1,6 +1,6 @@
 # VNX FC Direct Driver
 
-Copyright (c) 2012 - 2014 EMC Corporation
+Copyright (c) 2012 - 2015 EMC Corporation
 All Rights Reserved
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
@@ -83,9 +83,9 @@ Below mentioned steps are for a Compute node.Please follow the same steps for Ci
     * Login to Unisphere, go to `FNM0000000000->Hosts->Initiators`,
     * Refresh and wait until initiator `20:00:00:24:FF:48:BA:C2:21:00:00:24:FF:48:BA:C2` with SP Port `A-1` appears.
     * Click the `Register` button, select `CLARiiON/VNX` and enter the host name and IP address:
-	    * Hostname : myhost1
-	    * IP : 10.10.61.1
-	    * Click Register. 
+        * Hostname : myhost1
+        * IP : 10.10.61.1
+        * Click Register. 
     * Now host 10.10.61.1 will appear under Hosts->Host List as well.
 * Register the WWN or more WWNs to more ports if needed.
 
@@ -236,6 +236,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
+        io_port_list=a-1,B-3
         [backendB]
         storage_vnx_pool_name = Pool_02_SAS
         san_ip = 10.10.26.101
@@ -247,6 +248,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
+        io_port_list=a-1,B-3
         [database]
 
         max_pool_size=20
@@ -256,9 +258,21 @@ For more details on multi-backend, see [OpenStack Administration Guide](http://d
 
 ## Initiator Auto Registration
 
-When `initiator_auto_registration=True`, the driver will automatically register FC initiators to all working FC target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered)
+When `initiator_auto_registration=True`, the driver will automatically register FC initiators to all working FC target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered) if the option `io_port_list` is not specified in cinder.conf.
 
-If you want to register some initiators only on some specific ports and don't want them to be registered on other ports, this functionality should be disabled.
+When a comma-separated list is given to `io_port_list`, the driver will only register the initiator to the ports specified in the list and only return FC target port(s) which belong to the target ports in the `io_port_list` instead of all target ports.
+
+Here is an example
+
+    io_port_list=a-1,B-3
+
+`a` or `B` is **Storage Processor**, number `1` and `3` are **Port ID**.
+
+Note:
+
+* Rather than de-registered, the registered ports will be simply bypassed whatever they are in 'io_port_list' or not.
+
+* Driver will raise an exception when attaching a volume if ports in `io_port_list` are not existed in VNX.
 
 ## Batch Processing for Volume Attaching/Detaching
 

@@ -1,6 +1,6 @@
 # VNX iSCSI Direct Driver
 
-Copyright (c) 2012 - 2014 EMC Corporation
+Copyright (c) 2012 - 2015 EMC Corporation
 All Rights Reserved
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
@@ -93,13 +93,13 @@ Below mentioned steps are for a Compute node.Please follow the same steps for Ci
     * Login to Unisphere, go to `FNM0000000000->Hosts->Initiators`,
     * Refresh and wait until initiator `iqn.1993-08.org.debian:01:1a2b3c4d5f6g` with SP Port `A-8v0` appears.
     * Click the `Register` button, select `CLARiiON/VNX` and enter the host name and IP address:
-	    * Hostname : myhost1
-	    * IP : 10.10.61.1
-	    * Click Register. 
+        * Hostname : myhost1
+        * IP : 10.10.61.1
+        * Click Register. 
     * Now host 10.10.61.1 will appear under Hosts->Host List as well.
 * Log out iSCSI on the node:
 
-		$ sudo iscsiadm -m node -u
+        $ sudo iscsiadm -m node -u
 
 * Log in to VNX from the Compute node using the target corresponding to the SPB port:
 
@@ -264,6 +264,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
+        io_port_list=a-1-0,B-3-0
         use_multi_iscsi_portals=False
         [backendB]
         storage_vnx_pool_name = Pool_02_SAS
@@ -276,6 +277,7 @@ In following scenarios, VNX native LUN migration will not be triggered:
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
+        io_port_list=a-1-0,B-3-0
         use_multi_iscsi_portals=False
         [database]
 
@@ -286,9 +288,21 @@ For more details on multi-backend, see [OpenStack Administration Guide](http://d
 
 ## Initiator Auto Registration
 
-When `initiator_auto_registration=True`, the driver will automatically register iSCSI initiators to all working iSCSI target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered)
+When `initiator_auto_registration=True`, the driver will automatically register iSCSI initiators to all working iSCSI target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered) if the option `io_port_list` is not specified in cinder.conf.
 
-If you want to register some initiators only on some specific ports and don't want them to be registered on other ports, this functionality should be disabled.
+When a comma-separated list is given to `io_port_list`, API `initialize_connection()` will only register the initiator to the ports specified in the list and only return iSCSI target port(s) which belong to the target ports in the `io_port_list` instead of all target ports.When `use_multi_iscsi_portals` is also set to `True`, all working iSCSI target portals in `io_port_list` will be returned via `target_iqns` and `target_portals` in `connection_info` structure.
+
+Here is an example
+
+    io_port_list=a-1-0,B-3-0
+
+`a` or `B` is **Storage Processor**, the first numbers `1` and `3` are **Port ID** and the second number `0` is **Virtual Port ID**
+
+Note:
+
+* Rather than de-registered, the registered ports will be simply bypassed whatever they are in 'io_port_list' or not.
+
+* Driver will ignore ports which are not existed in VNX, and give a warning in Cinder log.
 
 ## Batch Processing for Volume Attaching/Detaching
 
@@ -303,7 +317,7 @@ Option `attach_detach_batch_interval` within the backend section is used to cont
 ## Multiple iSCSI Target Portals
 This is an experimental feature before OpenStack supports multiple iSCSI target portals officially. So it is subject to change later when OpenStack community finalizes the solution.
 
-When `use_multi_iscsi_portals=True` is given in the backend configuration, the API `initialize_connection()` can return all available iSCSI target portals as additional fields `target_iqns` and `target_portals` in `connection_info` struture besides existing `target_portal` and `target_iqn` fields. The default value of `use_multi_iscsi_portals` is `False`, which disables the experimental feature.
+When `use_multi_iscsi_portals=True` is given in the backend configuration, the API `initialize_connection()` can return all available iSCSI target portals as additional fields `target_iqns` and `target_portals` in `connection_info` structure besides existing `target_portal` and `target_iqn` fields. The default value of `use_multi_iscsi_portals` is `False`, which disables the experimental feature.
 
 ## Force Delete LUNs in Storage Groups
 
