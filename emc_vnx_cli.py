@@ -23,8 +23,13 @@ import time
 import types
 
 import eventlet
-from oslo.config import cfg
-from oslo.serialization import jsonutils as json
+from oslo_concurrency import lockutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils as json
+from oslo_utils import excutils
+from oslo_utils import timeutils
 import six
 import taskflow.engines
 from taskflow.patterns import linear_flow
@@ -33,31 +38,23 @@ from taskflow.types import failure
 
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
-from cinder.openstack.common import excutils
-from cinder.openstack.common import lockutils
-from cinder.openstack.common import log as logging
 from cinder.openstack.common import loopingcall
-from cinder.openstack.common import processutils
-from cinder.openstack.common import timeutils
 from cinder import utils
 from cinder.volume import configuration as config
-from cinder.volume.drivers.emc import queueworker
 from cinder.volume.drivers.san import san
 from cinder.volume import manager
 from cinder.volume import utils as vol_utils
 from cinder.volume import volume_types
 
 CONF = cfg.CONF
+
 LOG = logging.getLogger(__name__)
+
 
 INTERVAL_5_SEC = 5
 INTERVAL_20_SEC = 20
 INTERVAL_30_SEC = 30
 INTERVAL_60_SEC = 60
-
-NO_POLL = True
-
-BATCH_CHECK_INTERVAL = 5
 
 ENABLE_TRACE = False
 
@@ -100,6 +97,10 @@ loc_opts = [
                default='',
                help='Mapping between hostname and '
                'its iSCSI initiator IP addresses.'),
+    cfg.StrOpt('io_port_list',
+               default='*',
+               help='Comma separated iSCSI or FC ports '
+               'to be used in Nova or Cinder'),
     cfg.BoolOpt('initiator_auto_registration',
                 default=False,
                 help='Automatically register initiators. '
@@ -114,17 +115,9 @@ loc_opts = [
                 help='Report free_capacity_gb as 0 when the limit to '
                 'maximum number of pool LUNs is reached. '
                 'By default, the value is False.'),
-    cfg.IntOpt('attach_detach_batch_interval',
-               default=-1,
-               help='Interval in seconds for batch processing of volume '
-               'attaching and detaching. Setting it to -1 will disable'
-               'the batch processing. By default, the value is -1.'),
     cfg.BoolOpt('force_delete_lun_in_storagegroup',
                 default=False,
-                help='Delete a LUN even if it is in Storage Groups.'),
-    cfg.BoolOpt('use_multi_iscsi_portals',
-                default=False,
-                help="Return multiple iSCSI target portals")
+                help='Delete a LUN even if it is in Storage Groups.')
 ]
 
 CONF.register_opts(loc_opts)
@@ -178,14 +171,6 @@ class PropertyDescriptor(object):
         self.label = label
         self.key = key
         self.converter = converter
-
-
-class AddHluStatus(queueworker.Status):
-    NO_HLU_LEFT = -2
-
-
-class RemoveHluStatus(queueworker.Status):
-    HLU_NOT_IN_SG = -2
 
 
 @decorate_all_methods(log_enter_exit)
@@ -276,9 +261,11 @@ class CommandLineHelper(object):
     CLI_RESP_PATTERN_LUN_NOT_EXIST = 'The (pool lun) may not exist'
     CLI_RESP_PATTERN_SMP_NOT_ATTACHED = ('The specified Snapshot mount point '
                                          'is not currently attached.')
-    CLI_RESP_PATTERN_SG_NAME_IN_USE = "Storage Group name already in use"
-    CLI_RESP_PATTERN_LUN_IN_SG_1 = "contained in a Storage Group"
-    CLI_RESP_PATTERN_LUN_IN_SG_2 = "Host LUN/LUN mapping still exists"
+    CLI_RESP_PATTERN_SG_NAME_IN_USE = 'Storage Group name already in use'
+    CLI_RESP_PATTERN_LUN_IN_SG_1 = 'contained in a Storage Group'
+    CLI_RESP_PATTERN_LUN_IN_SG_2 = 'Host LUN/LUN mapping still exists'
+    CLI_RESP_PATTERN_LUN_NOT_MIGRATING = ('The specified source LUN '
+                                          'is not currently migrating')
 
     def __init__(self, configuration):
         configuration.append_config_values(san.san_opts)
@@ -374,7 +361,7 @@ class CommandLineHelper(object):
     def _raise_cli_error(self, cmd=None, rc=None, out='', **kwargs):
         raise exception.EMCVnxCLICmdError(cmd=cmd,
                                           rc=rc,
-                                          out=out,
+                                          out=out.split('\n'),
                                           **kwargs)
 
     def create_lun_with_advance_feature(self, pool, name, size,
@@ -432,22 +419,40 @@ class CommandLineHelper(object):
             else:
                 self._raise_cli_error(cmd, rc, out)
 
+        def _lun_state_validation(lun_data):
+            lun_state = lun_data[self.LUN_STATE.key]
+            if lun_state == 'Initializing':
+                return False
+            # Lun in Ready or Faulted state is eligible for IO access,
+            # so if no lun operation, return success.
+            elif lun_state in ['Ready', 'Faulted']:
+                return lun_data[self.LUN_OPERATION.key] == 'None'
+            # Raise exception if lun state is Offline, Invalid, Destroying
+            # or other unexpected states.
+            else:
+                msg = _("Volume %(lun_name)s was created in VNX, but in"
+                        " %(lun_state)s state."
+                        ) % {'lun_name': lun_data[self.LUN_NAME.key],
+                             'lun_state': lun_state}
+                raise exception.VolumeBackendAPIException(data=msg)
+
         def lun_is_ready():
             try:
                 data = self.get_lun_by_name(name, self.LUN_ALL, False)
-                return (data[self.LUN_STATE.key] == 'Ready' and
-                        data[self.LUN_STATUS.key] == 'OK(0x0)' and
-                        data[self.LUN_OPERATION.key] == 'None')
             except exception.EMCVnxCLICmdError as ex:
-                if ex.out.find(
+                orig_out = "\n".join(ex.kwargs["out"])
+                if orig_out.find(
                         self.CLI_RESP_PATTERN_LUN_NOT_EXIST) >= 0:
                     return False
                 else:
                     raise ex
+            return _lun_state_validation(data)
 
         self._wait_for_a_condition(lun_is_ready,
                                    None,
-                                   INTERVAL_5_SEC)
+                                   INTERVAL_5_SEC,
+                                   lambda ex:
+                                   isinstance(ex, exception.EMCVnxCLICmdError))
         lun = self.get_lun_by_name(name, self.LUN_ALL, False)
         return lun
 
@@ -492,29 +497,29 @@ class CommandLineHelper(object):
         return hlus
 
     def _wait_for_a_condition(self, testmethod, timeout=None,
-                              interval=INTERVAL_5_SEC, ignore_exception=True):
-
+                              interval=INTERVAL_5_SEC,
+                              ignorable_exception_arbiter=lambda ex: True):
         start_time = time.time()
         if timeout is None:
             timeout = self.timeout
 
         def _inner():
             try:
-                testValue = testmethod()
+                test_value = testmethod()
             except Exception as ex:
+                test_value = False
                 with excutils.save_and_reraise_exception(
-                        reraise=not ignore_exception):
-                    testValue = False
+                        reraise=not ignorable_exception_arbiter(ex)):
                     LOG.debug('CommandLineHelper.'
-                              '_wait_for_condition: %(method_name)s '
+                              '_wait_for_a_condition: %(method_name)s '
                               'execution failed for %(exception)s',
                               {'method_name': testmethod.__name__,
                                'exception': six.text_type(ex)})
-            if testValue:
+            if test_value:
                 raise loopingcall.LoopingCallDone()
 
             if int(time.time()) - start_time > timeout:
-                msg = (_('CommandLineHelper._wait_for_condition: %s timeout')
+                msg = (_('CommandLineHelper._wait_for_a_condition: %s timeout')
                        % testmethod.__name__)
                 LOG.error(msg)
                 raise exception.VolumeBackendAPIException(data=msg)
@@ -612,41 +617,67 @@ class CommandLineHelper(object):
             for m in re.finditer(cg_pat, out):
                 data['Name'] = m.groups()[0].strip()
                 data['State'] = m.groups()[4].strip()
-                luns_of_cg = m.groups()[3].split(',')
-                if luns_of_cg:
-                    data['Luns'] = [lun.strip() for lun in luns_of_cg]
+                # Handle case when no lun in cg Member LUN ID(s):  None
+                luns_of_cg = m.groups()[3].replace('None', '').strip()
+                data['Luns'] = ([lun.strip() for lun in luns_of_cg.split(',')]
+                                if luns_of_cg else [])
                 LOG.debug("Found consistent group %s.", data['Name'])
 
         return data
 
-    def add_lun_to_consistency_group(self, cg_name, lun_id):
-        add_lun_to_cg_cmd = ('-np', 'snap', '-group',
+    def add_lun_to_consistency_group(self, cg_name, lun_id, poll=False):
+        add_lun_to_cg_cmd = ('snap', '-group',
                              '-addmember', '-id',
                              cg_name, '-res', lun_id)
 
-        out, rc = self.command_execute(*add_lun_to_cg_cmd)
+        out, rc = self.command_execute(*add_lun_to_cg_cmd, poll=poll)
         if rc != 0:
-            msg = (_("Can not add the lun %(lun)s to consistency "
-                   "group %(cg_name)s.") % {'lun': lun_id,
-                                            'cg_name': cg_name})
-            LOG.error(msg)
+            LOG.error(_LE("Can not add the lun %(lun)s to consistency "
+                          "group %(cg_name)s."), {'lun': lun_id,
+                                                  'cg_name': cg_name})
             self._raise_cli_error(add_lun_to_cg_cmd, rc, out)
 
         def add_lun_to_consistency_success():
             data = self.get_consistency_group_by_name(cg_name)
             if str(lun_id) in data['Luns']:
-                LOG.debug(("Add lun %(lun)s to consistency "
-                           "group %(cg_name)s successfully."),
+                LOG.debug("Add lun %(lun)s to consistency "
+                          "group %(cg_name)s successfully.",
                           {'lun': lun_id, 'cg_name': cg_name})
                 return True
             else:
-                LOG.debug(("Adding lun %(lun)s to consistency "
-                           "group %(cg_name)s."),
+                LOG.debug("Adding lun %(lun)s to consistency "
+                          "group %(cg_name)s.",
                           {'lun': lun_id, 'cg_name': cg_name})
                 return False
 
         self._wait_for_a_condition(add_lun_to_consistency_success,
                                    interval=INTERVAL_30_SEC)
+
+    def remove_luns_from_consistencygroup(self, cg_name, remove_ids,
+                                          poll=False):
+        """Removes LUN(s) from cg"""
+        remove_luns_cmd = ('snap', '-group', '-rmmember',
+                           '-id', cg_name,
+                           '-res', ','.join(remove_ids))
+        out, rc = self.command_execute(*remove_luns_cmd, poll=poll)
+        if rc != 0:
+            LOG.error(_LE("Can not remove LUNs %(luns)s in consistency "
+                          "group %(cg_name)s."), {'luns': remove_ids,
+                                                  'cg_name': cg_name})
+            self._raise_cli_error(remove_luns_cmd, rc, out)
+
+    def replace_luns_in_consistencygroup(self, cg_name, new_ids,
+                                         poll=False):
+        """Replaces LUN(s) with new_ids for cg"""
+        replace_luns_cmd = ('snap', '-group', '-replmember',
+                            '-id', cg_name,
+                            '-res', ','.join(new_ids))
+        out, rc = self.command_execute(*replace_luns_cmd, poll=poll)
+        if rc != 0:
+            LOG.error(_LE("Can not place new LUNs %(luns)s in consistency "
+                          "group %(cg_name)s."), {'luns': new_ids,
+                                                  'cg_name': cg_name})
+            self._raise_cli_error(replace_luns_cmd, rc, out)
 
     def delete_consistencygroup(self, cg_name):
         delete_cg_cmd = ('-np', 'snap', '-group',
@@ -844,11 +875,12 @@ class CommandLineHelper(object):
             self.migrate_lun(src_id, dst_id)
         except exception.EMCVnxCLICmdError as ex:
             migration_succeed = False
-            if self._is_sp_unavailable_error(ex.out):
+            orig_out = "\n".join(ex.kwargs["out"])
+            if self._is_sp_unavailable_error(orig_out):
                 LOG.warning(_LW("Migration command may get network timeout. "
                                 "Double check whether migration in fact "
                                 "started successfully. Message: %(msg)s"),
-                            {'msg': ex.out})
+                            {'msg': ex.kwargs["out"]})
                 command_migrate_list = ('migrate', '-list',
                                         '-source', src_id)
                 rc = self.command_execute(*command_migrate_list,
@@ -858,7 +890,7 @@ class CommandLineHelper(object):
 
             if not migration_succeed:
                 LOG.warning(_LW("Start migration failed. Message: %s"),
-                            ex.out)
+                            ex.kwargs["out"])
                 if dst_name is not None:
                     LOG.warning(_LW("Delete temp LUN after migration "
                                     "start failed. LUN: %s"), dst_name)
@@ -883,16 +915,17 @@ class CommandLineHelper(object):
                     self._raise_cli_error(cmd_migrate_list, rc, out)
                 if ("FAULTED" in current_state or
                         "STOPPED" in current_state):
-                    reason = _("Migration of LUN %s has been Stopped or"
-                               " Faulted.") % src_id
+                    reason = _("Migration of LUN %s has been stopped or"
+                               " faulted.") % src_id
                     raise exception.VolumeBackendAPIException(data=reason)
                 if ("TRANSITIONING" in current_state or
                         "MIGRATING" in current_state):
-                    LOG.debug("Migration of LUN %s in process %s %%.",
-                              (src_id, percentage_complete))
+                    LOG.debug("Migration of LUN %(src_id)s in process "
+                              "%(percentage)s %%.",
+                              {"src_id": src_id,
+                               "percentage": percentage_complete})
             else:
-                if re.search(r'The specified source LUN '
-                             'is not currently migrating', out):
+                if re.search(self.CLI_RESP_PATTERN_LUN_NOT_MIGRATING, out):
                     LOG.debug("Migration of LUN %s is finished.", src_id)
                     mig_ready = True
                 else:
@@ -904,12 +937,12 @@ class CommandLineHelper(object):
             out, rc = self.command_execute(*cmd_migrate_list,
                                            poll=poll)
             if rc != 0:
-                if re.search(r'The specified source LUN '
-                             'is not currently migrating', out):
+                if re.search(self.CLI_RESP_PATTERN_LUN_NOT_MIGRATING, out):
                     LOG.debug("Migration of LUN %s is finished.", src_id)
                     return True
                 else:
-                    LOG.error(_LE("Failed to query migration status."))
+                    LOG.error(_LE("Failed to query migration status of LUN."),
+                              src_id)
                     self._raise_cli_error(cmd_migrate_list, rc, out)
             return False
 
@@ -918,9 +951,11 @@ class CommandLineHelper(object):
         try:
             if migration_is_ready(True):
                 return True
-            self._wait_for_a_condition(migration_is_ready,
-                                       interval=INTERVAL_30_SEC,
-                                       ignore_exception=False)
+            self._wait_for_a_condition(
+                migration_is_ready,
+                interval=INTERVAL_30_SEC,
+                ignorable_exception_arbiter=lambda ex:
+                type(ex) is not exception.VolumeBackendAPIException)
         # Migration cancellation for clean up
         except exception.VolumeBackendAPIException:
             with excutils.save_and_reraise_exception():
@@ -934,7 +969,7 @@ class CommandLineHelper(object):
 
     # Cancel migration in case where status is faulted or stopped
     def migration_cancel(self, src_id):
-        LOG.info(_LI("Cancelling Migration from LUN %s"), src_id)
+        LOG.info(_LI("Cancelling Migration from LUN %s."), src_id)
         cmd_migrate_cancel = ('migrate', '-cancel', '-source', src_id,
                               '-o')
         out, rc = self.command_execute(*cmd_migrate_cancel)
@@ -1040,6 +1075,10 @@ class CommandLineHelper(object):
                 self._raise_cli_error(command_host_disconnect, rc, out)
 
     def add_hlu_to_storage_group(self, hlu, alu, sg_name):
+        """Adds a lun into storage group as specified hlu number.
+
+        Return True if the hlu is as specified, otherwise False.
+        """
 
         command_add_hlu = ('storagegroup', '-addhlu',
                            '-hlu', hlu,
@@ -1053,34 +1092,6 @@ class CommandLineHelper(object):
             self._raise_cli_error(command_add_hlu, rc, out)
 
         return True
-
-    def add_hlus_to_storage_group(self, hlulist, alulist, sg_name):
-
-        hlusstr = ",".join(map(lambda a: str(a), hlulist))
-        alusstr = ",".join(map(lambda a: str(a), alulist))
-        command_add_hlu = ('storagegroup', '-addhlu',
-                           '-gname', sg_name,
-                           '-hlus', hlusstr, '-alus', alusstr,
-                           '-verboseStatus', '-o')
-
-        out, rc = self.command_execute(*command_add_hlu,
-                                       poll=False,
-                                       retry_disable=True)
-        added_alus_pattern = 'LUs Added:\s*([0-9,]*).'
-        searchout = re.search(added_alus_pattern, out)
-        if searchout is not None:
-            added_alus_str = searchout.group(1).strip()
-            if len(added_alus_str) != 0:
-                added_alus = map(lambda item: int(item),
-                                 added_alus_str.split(","))
-            else:
-                added_alus = []
-        else:
-            added_alus = []
-
-        added_alus = set(added_alus)
-        not_added_alus = set(alulist) - added_alus
-        return added_alus, not_added_alus
 
     def remove_hlu_from_storagegroup(self, hlu, sg_name, poll=False):
 
@@ -1099,34 +1110,6 @@ class CommandLineHelper(object):
                             {'hlu': hlu, 'sgname': sg_name, 'msg': out})
             else:
                 self._raise_cli_error(command_remove_hlu, rc, out)
-
-    def remove_hlus_from_storage_group(self, hlus, sg_name):
-
-        hlusstr = ",".join(map(lambda a: str(a), hlus))
-        command_remove_hlu = ('storagegroup', '-removehlu',
-                              '-gname', sg_name,
-                              '-hlus', hlusstr, '-verboseStatus',
-                              '-o')
-
-        out, rc = self.command_execute(*command_remove_hlu,
-                                       poll=False,
-                                       retry_disable=True)
-        removed_alus_pattern = 'LUs Removed:\s*([0-9,]*).'
-        searchout = re.search(removed_alus_pattern, out)
-        if searchout is not None:
-            removed_alus_str = searchout.group(1).strip()
-            if len(removed_alus_str) != 0:
-                removed_hlus = map(lambda item: int(item),
-                                   removed_alus_str.split(","))
-            else:
-                removed_hlus = []
-        else:
-            removed_hlus = []
-
-        removed_hlus = set(removed_hlus)
-        not_removed_hlus = set(hlus) - removed_hlus
-
-        return removed_hlus, not_removed_hlus
 
     def get_iscsi_protocol_endpoints(self, device_sp):
 
@@ -1293,46 +1276,41 @@ class CommandLineHelper(object):
 
         return data
 
-    def get_status_up_ports(self, storage_group_name, poll=True, sgdata=None):
-        """Function to get ports whose status are up.
-
-        sgdata should be the raw output of storagegroup list query
-        """
-
-        if not sgdata:
-            cmd_get_hba = ('storagegroup', '-list', '-gname',
-                           storage_group_name)
-            out, rc = self.command_execute(*cmd_get_hba, poll=poll)
-            if rc == 83:
-                LOG.warning(_LW("Storage Group %s is not found."),
-                            storage_group_name)
-                return []
-            elif rc != 0:
-                self._raise_cli_error(cmd_get_hba, rc, out)
-            sgdata = out
-
+    def get_status_up_ports(self, storage_group_name, io_ports=None,
+                            poll=True):
+        """Function to get ports whose status are up."""
+        cmd_get_hba = ('storagegroup', '-list', '-gname', storage_group_name)
+        out, rc = self.command_execute(*cmd_get_hba, poll=poll)
         wwns = []
-        _re_hba_sp_pair = re.compile('((\w\w:){15}(\w\w)\s*' +
-                                     '(SP\s[A-B]){1}\s*(\d*)\s*\n)')
-        _all_hba_sp_pairs = re.findall(_re_hba_sp_pair, sgdata)
-        sps = [each[3] for each in _all_hba_sp_pairs]
-        portid = [each[4] for each in _all_hba_sp_pairs]
-        cmd_get_port = ('port', '-list', '-sp')
-        out, rc = self.command_execute(*cmd_get_port, poll=poll)
-        if 0 != rc:
-            self._raise_cli_error(cmd_get_port, rc, out)
-        for i, sp in enumerate(sps):
-            wwn = self.get_port_wwn(sp, portid[i], out)
-            if (wwn is not None) and (wwn not in wwns):
-                LOG.debug('Add wwn:%(wwn)s for sg:%(sg)s.',
-                          {'wwn': wwn,
-                           'sg': storage_group_name})
-                wwns.append(wwn)
-
+        if 0 == rc:
+            _re_hba_sp_pair = re.compile('((\w\w:){15}(\w\w)\s*' +
+                                         '(SP\s[A-B]){1}\s*(\d*)\s*\n)')
+            _all_hba_sp_pairs = re.findall(_re_hba_sp_pair, out)
+            sps = [each[3] for each in _all_hba_sp_pairs]
+            portid = [each[4] for each in _all_hba_sp_pairs]
+            cmd_get_port = ('port', '-list', '-sp')
+            out, rc = self.command_execute(*cmd_get_port)
+            if 0 != rc:
+                self._raise_cli_error(cmd_get_port, rc, out)
+            for i, sp in enumerate(sps):
+                if io_ports:  # Skip ports which are not in io_ports
+                    if (sp.split()[1], int(portid[i])) not in io_ports:
+                        continue
+                wwn = self.get_port_wwn(sp, portid[i], out)
+                if (wwn is not None) and (wwn not in wwns):
+                    LOG.debug('Add wwn:%(wwn)s for sg:%(sg)s.',
+                              {'wwn': wwn,
+                               'sg': storage_group_name})
+                    wwns.append(wwn)
+        elif 83 == rc:
+            LOG.warning(_LW("Storage Group %s is not found."),
+                        storage_group_name)
+        else:
+            self._raise_cli_error(cmd_get_hba, rc, out)
         return wwns
 
-    def get_login_ports(self, storage_group_name, connector_wwpns):
-
+    def get_login_ports(self, storage_group_name, connector_wwpns,
+                        io_ports=None):
         cmd_list_hba = ('port', '-list', '-gname', storage_group_name)
         out, rc = self.command_execute(*cmd_list_hba)
         ports = []
@@ -1353,9 +1331,14 @@ class CommandLineHelper(object):
                                   'HBA Devicename:.*\n\s*' +
                                   'Trusted:.*\n\s*' +
                                   'Logged In:\s*YES\n')
+
             for each in connector_hba_list:
                 ports.extend(re.findall(port_pat, each))
             ports = list(set(ports))
+            if io_ports:
+                ports = filter(lambda po:
+                               (po[0].split()[1], int(po[1])) in io_ports,
+                               ports)
             for each in ports:
                 wwn = self.get_port_wwn(each[0], each[1], allports)
                 if wwn:
@@ -1365,16 +1348,15 @@ class CommandLineHelper(object):
         return wwns
 
     def get_port_wwn(self, sp, port_id, allports=None):
+        """Returns wwn via sp and port_id
+        :param sp: should be in this format 'SP A'
+        :param port_id: '0' or 0
+        """
         wwn = None
         if allports is None:
-            cmd_get_port = ('port', '-list', '-sp')
-            out, rc = self.command_execute(*cmd_get_port)
-            if 0 != rc:
-                self._raise_cli_error(cmd_get_port, rc, out)
-            else:
-                allports = out
+            allports, rc = self.get_port_output()
         _re_port_wwn = re.compile('SP Name:\s*' + sp +
-                                  '\nSP Port ID:\s*' + port_id +
+                                  '\nSP Port ID:\s*' + str(port_id) +
                                   '\nSP UID:\s*((\w\w:){15}(\w\w))' +
                                   '\nLink Status:         Up' +
                                   '\nPort Status:         Online')
@@ -1384,11 +1366,7 @@ class CommandLineHelper(object):
         return wwn
 
     def get_fc_targets(self):
-        fc_getport = ('port', '-list', '-sp')
-        out, rc = self.command_execute(*fc_getport)
-        if rc != 0:
-            self._raise_cli_error(fc_getport, rc, out)
-
+        out, rc = self.get_port_output()
         fc_target_dict = {'A': [], 'B': []}
 
         _fcport_pat = (r'SP Name:             SP\s(\w)\s*'
@@ -1404,7 +1382,42 @@ class CommandLineHelper(object):
                                        'Port ID': sp_port_id})
         return fc_target_dict
 
-    def get_iscsi_targets(self, poll=True):
+    def get_port_output(self):
+        cmd_get_port = ('port', '-list', '-sp')
+        out, rc = self.command_execute(*cmd_get_port)
+        if 0 != rc:
+            self._raise_cli_error(cmd_get_port, rc, out)
+        return out, rc
+
+    def get_connection_getport_output(self):
+        connection_getport_cmd = ('connection', '-getport', '-vlanid')
+        out, rc = self.command_execute(*connection_getport_cmd)
+        if 0 != rc:
+            self._raise_cli_error(connection_getport_cmd, rc, out)
+        return out, rc
+
+    def _filter_iscsi_ports(self, all_ports, io_ports):
+        """Filter ports in white list from all iSCSI ports."""
+        new_iscsi_ports = {'A': [], 'B': []}
+        valid_ports = []
+        for sp in all_ports:
+            for port in all_ports[sp]:
+                port_tuple = (port['SP'],
+                              port['Port ID'],
+                              port['Virtual Port ID'])
+                if port_tuple in io_ports:
+                    new_iscsi_ports[sp].append(port)
+                    valid_ports.append(port_tuple)
+        if len(io_ports) != len(valid_ports):
+            invalid_port_set = set(io_ports) - set(valid_ports)
+            for invalid in invalid_port_set:
+                LOG.warn(_LW('Invalid iSCSI port %(sp)s-%(port)s-%(vlan)s '
+                             'found in io_port_list, will be ignored.'),
+                         {'sp': invalid[0], 'port': invalid[1],
+                          'vlan': invalid[2]})
+        return new_iscsi_ports
+
+    def get_iscsi_targets(self, poll=False, io_ports=None):
         cmd_getport = ('connection', '-getport', '-address', '-vlanid')
         out, rc = self.command_execute(*cmd_getport, poll=poll)
         if rc != 0:
@@ -1437,7 +1450,8 @@ class CommandLineHelper(object):
                                               'Port WWN': iqn,
                                               'Virtual Port ID': vport_id,
                                               'IP Address': ip_addr})
-
+        if io_ports:
+            return self._filter_iscsi_ports(iscsi_target_dict, io_ports)
         return iscsi_target_dict
 
     def get_registered_spport_set(self, initiator_iqn, sgname, sg_raw_out):
@@ -1470,10 +1484,11 @@ class CommandLineHelper(object):
                     connection_pingnode)
         return False
 
-    def find_avaialable_iscsi_target_one(self, hostname,
-                                         preferred_sp,
-                                         registered_spport_set,
-                                         all_iscsi_targets):
+    def find_available_iscsi_targets(self, hostname,
+                                     preferred_sp,
+                                     registered_spport_set,
+                                     all_iscsi_targets,
+                                     multipath=False):
         if self.iscsi_initiator_map and hostname in self.iscsi_initiator_map:
             iscsi_initiator_ips = list(self.iscsi_initiator_map[hostname])
             random.shuffle(iscsi_initiator_ips)
@@ -1484,6 +1499,21 @@ class CommandLineHelper(object):
             target_sps = ('A', 'B')
         else:
             target_sps = ('B', 'A')
+
+        if multipath:
+            target_portals = []
+            for target_sp in target_sps:
+                sp_portals = all_iscsi_targets[target_sp]
+                for portal in sp_portals:
+                    spport = (portal['SP'], portal['Port ID'])
+                    if spport not in registered_spport_set:
+                        LOG.debug("Skip SP Port %(port)s since "
+                                  "no path from %(host)s is through it",
+                                  {'port': spport,
+                                   'host': hostname})
+                        continue
+                    target_portals.append(portal)
+            return target_portals
 
         for target_sp in target_sps:
             target_portals = list(all_iscsi_targets[target_sp])
@@ -1499,13 +1529,13 @@ class CommandLineHelper(object):
                 if iscsi_initiator_ips is not None:
                     for initiator_ip in iscsi_initiator_ips:
                         if self.ping_node(target_portal, initiator_ip):
-                            return target_portal
+                            return [target_portal]
                 else:
                     LOG.debug("No iSCSI IP address of %(hostname)s is known. "
                               "Return a random target portal %(portal)s.",
                               {'hostname': hostname,
                                'portal': target_portal})
-                    return target_portal
+                    return [target_portal]
 
         return None
 
@@ -1666,7 +1696,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '04.02.00'
+    VERSION = '05.04.00'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
@@ -1694,7 +1724,6 @@ class EMCVnxCliBase(object):
             from cinder.zonemanager import fc_san_lookup_service as fc_service
             self.zonemanager_lookup_service = \
                 fc_service.FCSanLookupService(configuration=configuration)
-        self.multi_portals = self.configuration.use_multi_iscsi_portals
         self.max_retries = 5
         if self.destroy_empty_sg:
             LOG.warning(_LW("destroy_empty_storage_group: True. "
@@ -1707,26 +1736,69 @@ class EMCVnxCliBase(object):
         self.hlu_set = set(xrange(1, self.max_luns_per_sg + 1))
         self._client = CommandLineHelper(self.configuration)
         self.array_serial = None
+        self.io_ports = self._parse_ports(self.configuration.io_port_list,
+                                          self.protocol)
         if self.protocol == 'iSCSI':
-            self.iscsi_targets = self._client.get_iscsi_targets(poll=True)
-
-        self.attach_detach_batch_interval = (
-            self.configuration.attach_detach_batch_interval)
-        if self.attach_detach_batch_interval < 0:
-            self.do_initialize_connection = self._do_initialize_connection
-            self.do_terminate_connection = self._do_terminate_connection
-            self.hlu_cache = {}
-        else:
-            self.do_initialize_connection = (
-                self._do_initialize_connection_in_batch)
-            self.do_terminate_connection = (
-                self._do_terminate_connection_in_batch)
-            self.addhlu_workers = {}
-
+            self.iscsi_targets = self._client.get_iscsi_targets(
+                poll=True, io_ports=self.io_ports)
+        self.hlu_cache = {}
         self.force_delete_lun_in_sg = (
             self.configuration.force_delete_lun_in_storagegroup)
         if self.force_delete_lun_in_sg:
             LOG.warning(_LW("force_delete_lun_in_storagegroup=True"))
+
+    def _parse_ports(self, io_port_list, protocol):
+        """Validates IO port format, supported format is a-1, b-3, a-3-0."""
+        if not io_port_list or io_port_list == '*':
+            return None
+        ports = re.split('\s*,\s*', io_port_list)
+        valid_ports = []
+        invalid_ports = []
+        if 'iSCSI' == protocol:
+            out, rc = self._client.get_connection_getport_output()
+            for port in ports:
+                port_tuple = port.split('-')
+                if re.match('[abAB]-\d+-\d+$', port) and \
+                        self._validate_iscsi_port(
+                            port_tuple[0], port_tuple[1], port_tuple[2], out):
+                    valid_ports.append(
+                        (port_tuple[0].upper(), int(port_tuple[1]),
+                         int(port_tuple[2])))
+                else:
+                    invalid_ports.append(port)
+        elif 'FC' == protocol:
+            out, rc = self._client.get_port_output()
+            for port in ports:
+                port_tuple = port.split('-')
+                if re.match('[abAB]-\d+$', port) and self._validate_fc_port(
+                        port_tuple[0], port_tuple[1], out):
+                    valid_ports.append(
+                        (port_tuple[0].upper(), int(port_tuple[1])))
+                else:
+                    invalid_ports.append(port)
+        if len(invalid_ports) > 0:
+            msg = _LE('Invalid %(protocol)s ports %(port)s specified '
+                      'for io_port_list.') % {'protocol': self.protocol,
+                                              'port': ','.join(invalid_ports)}
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+        return valid_ports
+
+    def _validate_iscsi_port(self, sp, port_id, vlan_id, cmd_output):
+        """Validates whether the iSCSI port is existed on VNX"""
+        iscsi_pattern = ('SP:\s+' + sp.upper() +
+                         '\nPort ID:\s+' + str(port_id) +
+                         '\nPort WWN:\s+.*' +
+                         '\niSCSI Alias:\s+.*\n'
+                         '\nVirtual Port ID:\s+' + str(vlan_id))
+        return re.search(iscsi_pattern, cmd_output)
+
+    def _validate_fc_port(self, sp, port_id, cmd_output):
+        """Validates whether the FC port is existed on VNX"""
+        fc_pattern = ('SP Name:\s*SP\s*' + sp.upper() +
+                      '\nSP Port ID:\s*' + str(port_id) +
+                      '\nSP UID:\s*((\w\w:){15}(\w\w))')
+        return re.search(fc_pattern, cmd_output)
 
     def get_target_storagepool(self, volume, source_volume=None):
         raise NotImplementedError
@@ -1882,9 +1954,10 @@ class EMCVnxCliBase(object):
         try:
             self._client.delete_lun(volume['name'])
         except exception.EMCVnxCLICmdError as ex:
+            orig_out = "\n".join(ex.kwargs["out"])
             if (self.force_delete_lun_in_sg and
-                    (self._client.CLI_RESP_PATTERN_LUN_IN_SG_1 in ex.out or
-                     self._client.CLI_RESP_PATTERN_LUN_IN_SG_2 in ex.out)):
+                    (self._client.CLI_RESP_PATTERN_LUN_IN_SG_1 in orig_out or
+                     self._client.CLI_RESP_PATTERN_LUN_IN_SG_2 in orig_out)):
                 LOG.warning(_LW('LUN corresponding to %s is still '
                                 'in some Storage Groups.'
                                 'Try to bring the LUN out of Storage Groups '
@@ -1904,8 +1977,7 @@ class EMCVnxCliBase(object):
         self._client.expand_lun_and_wait(volume['name'], new_size)
 
     def _get_original_status(self, volume):
-        if (volume['instance_uuid'] is None and
-                volume['attached_host'] is None):
+        if not volume['volume_attachment']:
             return 'available'
         else:
             return 'in-use'
@@ -2147,7 +2219,8 @@ class EMCVnxCliBase(object):
             'True' if '-VNXSnapshots' in self.enablers else 'False')
 
         if self.protocol == 'iSCSI':
-            self.iscsi_targets = self._client.get_iscsi_targets(poll=False)
+            self.iscsi_targets = self._client.get_iscsi_targets(
+                poll=False, io_ports=self.io_ports)
 
         return self.stats
 
@@ -2281,11 +2354,28 @@ class EMCVnxCliBase(object):
             if len(fields) == 2 and fields[0] == key:
                 return fields[1]
 
+    def _consistencygroup_creation_check(self, group):
+        """Check extra spec for consistency group."""
+
+        if group.get('volume_type_id') is not None:
+            for id in group['volume_type_id'].split(","):
+                if id:
+                    provisioning, tiering = self._get_extra_spec_value(
+                        volume_types.get_volume_type_extra_specs(id))
+                    if provisioning == 'compressed':
+                        msg = _("Failed to create consistency group %s "
+                                "because VNX consistency group cannot "
+                                "accept compressed LUNs as members."
+                                ) % group['id']
+                        raise exception.VolumeBackendAPIException(data=msg)
+
     def create_consistencygroup(self, context, group):
         """Creates a consistency group."""
         LOG.info(_LI('Start to create consistency group: %(group_name)s '
                      'id: %(id)s'),
                  {'group_name': group['name'], 'id': group['id']})
+
+        self._consistencygroup_creation_check(group)
 
         model_update = {'status': 'available'}
         try:
@@ -2323,6 +2413,41 @@ class EMCVnxCliBase(object):
                 model_update['status'] = 'error_deleting'
 
         return model_update, volumes
+
+    def update_consistencygroup(self, context,
+                                group,
+                                add_volumes,
+                                remove_volumes):
+        """Adds or removes LUN(s) to/from an existing consistency group"""
+        model_update = {'status': 'available'}
+        cg_name = group['id']
+        add_ids = [six.text_type(self.get_lun_id(vol))
+                   for vol in add_volumes] if add_volumes else []
+        remove_ids = [six.text_type(self.get_lun_id(vol))
+                      for vol in remove_volumes] if remove_volumes else []
+
+        data = self._client.get_consistency_group_by_name(cg_name)
+        ids_curr = data['Luns']
+        ids_later = []
+
+        if ids_curr:
+            ids_later.extend(ids_curr)
+        ids_later.extend(add_ids)
+        for remove_id in remove_ids:
+            if remove_id in ids_later:
+                ids_later.remove(remove_id)
+            else:
+                LOG.warning(_LW("LUN with id %(remove_id)s is not present "
+                                "in cg %(cg_name)s, skip it."),
+                            {'remove_id': remove_id, 'cg_name': cg_name})
+        # Remove all from cg
+        if not ids_later:
+            self._client.remove_luns_from_consistencygroup(cg_name,
+                                                           ids_curr)
+        else:
+            self._client.replace_luns_in_consistencygroup(cg_name,
+                                                          ids_later)
+        return model_update, None, None
 
     def create_cgsnapshot(self, driver, context, cgsnapshot):
         """Creates a cgsnapshot (snap group)."""
@@ -2410,7 +2535,7 @@ class EMCVnxCliBase(object):
         try:
             self._client.connect_host_to_storage_group(hostname, storage_group)
         except exception.EMCVnxCLICmdError as ex:
-            if ex.rc == 83:
+            if ex.kwargs["rc"] == 83:
                 # SG was not created or was destroyed by another concurrent
                 # operation before connected.
                 # Create SG and try to connect again
@@ -2486,8 +2611,60 @@ class EMCVnxCliBase(object):
                          'portid': port_id,
                          'msg': out})
 
-    def _register_iscsi_initiator(self, ip, host, initiator_uids):
-        iscsi_targets = self.iscsi_targets
+    def auto_register_with_io_port_filter(self, connector, sgdata,
+                                          io_port_filter):
+        """Automatically register specific IO ports to storage group."""
+        initiator = connector['initiator']
+        ip = connector['ip']
+        host = connector['host']
+        new_white = {'A': [], 'B': []}
+        if self.protocol == 'iSCSI':
+            if sgdata:
+                sp_ports = self._client.get_registered_spport_set(
+                    initiator, host, sgdata['raw_output'])
+                # Normalize io_ports
+                for sp in ('A', 'B'):
+                    new_ports = filter(
+                        lambda pt: (pt['SP'], pt['Port ID']) not in sp_ports,
+                        self.iscsi_targets[sp])
+                    new_white[sp] = map(lambda white:
+                                        {'SP': white['SP'],
+                                         'Port ID': white['Port ID'],
+                                         'Virtual Port ID':
+                                             white['Virtual Port ID']},
+                                        new_ports)
+            else:
+                new_white = self.iscsi_targets
+            self._register_iscsi_initiator(ip, host, [initiator], new_white)
+
+        elif self.protocol == 'FC':
+            wwns = self._extract_fc_uids(connector)
+            ports_list = []
+            if sgdata:
+                for wwn in wwns:
+                    for port in io_port_filter:
+                        if (port not in ports_list) and \
+                                (not re.search(wwn + '\s+SP\s+' +
+                                               port[0] + '\s+' + str(port[1]),
+                                               sgdata['raw_output'],
+                                               re.IGNORECASE)):
+                            # Record ports to be added
+                            ports_list.append(port)
+                            new_white[port[0]].append({
+                                'SP': port[0],
+                                'Port ID': port[1]})
+            else:
+                # Need to translate to dict format
+                for fc_port in io_port_filter:
+                    new_white[fc_port[0]].append({'SP': fc_port[0],
+                                                  'Port ID': fc_port[1]})
+            self._register_fc_initiator(ip, host, wwns, new_white)
+        return new_white['A'] or new_white['B']
+
+    def _register_iscsi_initiator(self, ip, host, initiator_uids,
+                                  port_to_register=None):
+        iscsi_targets = (port_to_register if port_to_register else
+                         self.iscsi_targets)
         for initiator_uid in initiator_uids:
             LOG.info(_LI('Get ISCSI targets %(tg)s to register '
                          'initiator %(in)s.'),
@@ -2511,8 +2688,10 @@ class EMCVnxCliBase(object):
                 self._exec_command_setpath(initiator_uid, sp, port_id,
                                            ip, host, vport_id)
 
-    def _register_fc_initiator(self, ip, host, initiator_uids):
-        fc_targets = self._client.get_fc_targets()
+    def _register_fc_initiator(self, ip, host, initiator_uids,
+                               ports_to_register=None):
+        fc_targets = (ports_to_register if ports_to_register else
+                      self._client.get_fc_targets())
         for initiator_uid in initiator_uids:
             LOG.info(_LI('Get FC targets %(tg)s to register '
                          'initiator %(in)s.'),
@@ -2567,7 +2746,7 @@ class EMCVnxCliBase(object):
                 unregistered_initiators.append(initiator_uid)
         return unregistered_initiators
 
-    def auto_register_initiator(self, connector, sgdata):
+    def auto_register_initiator_to_all(self, connector, sgdata):
         """Automatically registers available initiators.
 
         Returns True if has registered initiator otherwise returns False.
@@ -2612,36 +2791,43 @@ class EMCVnxCliBase(object):
             self._register_fc_initiator(ip, host, itors_toReg)
             return True
 
-    def _prepare_storage_group(self, connector, poll_on_first_query=True):
+    def auto_register_initiator(self, connector, sgdata, io_ports_filter=None):
+        """Automatically register available initiators.
+        Return True if has registerred initiator otherwise return False
+        """
+        if io_ports_filter:
+            return self.auto_register_with_io_port_filter(connector, sgdata,
+                                                          io_ports_filter)
+        else:
+            return self.auto_register_initiator_to_all(connector, sgdata)
+
+    def assure_host_access(self, volume, connector):
         hostname = connector['host']
+        volumename = volume['name']
         auto_registration_done = False
         try:
             sgdata = self._client.get_storage_group(hostname,
-                                                    poll=poll_on_first_query)
+                                                    poll=False)
         except exception.EMCVnxCLICmdError as ex:
-            if ex.rc != 83:
+            if ex.kwargs["rc"] != 83:
                 raise ex
             # Storage Group has not existed yet
             self.assure_storage_group(hostname)
             if self.itor_auto_reg:
-                self.auto_register_initiator(connector, None)
+                self.auto_register_initiator(connector, None, self.io_ports)
                 auto_registration_done = True
             else:
                 self._client.connect_host_to_storage_group(hostname, hostname)
 
-            sgdata = self._client.get_storage_group(hostname, poll=True)
+            sgdata = self._client.get_storage_group(hostname,
+                                                    poll=True)
 
         if self.itor_auto_reg and not auto_registration_done:
-            new_registerred = self.auto_register_initiator(connector, sgdata)
+            new_registerred = self.auto_register_initiator(connector, sgdata,
+                                                           self.io_ports)
             if new_registerred:
-                sgdata = self._client.get_storage_group(hostname, poll=True)
-        return sgdata
-
-    def assure_host_access(self, volume, connector):
-        sgdata = self._prepare_storage_group(connector,
-                                             poll_on_first_query=False)
-        hostname = connector['host']
-        volumename = volume['name']
+                sgdata = self._client.get_storage_group(hostname,
+                                                        poll=True)
 
         lun_id = self.get_lun_id(volume)
         tried = 0
@@ -2665,7 +2851,7 @@ class EMCVnxCliBase(object):
                         self.hlu_cache[hostname] = {}
                     self.hlu_cache[hostname][lun_id] = hlu
                     return hlu, sgdata
-                except exception.EMCVnxCLICmdError:
+                except exception.EMCVnxCLICmdError as ex:
                     LOG.debug("Add HLU to storagegroup failed, retry %s",
                               tried)
             elif tried == 1:
@@ -2700,45 +2886,48 @@ class EMCVnxCliBase(object):
 
     def vnx_get_iscsi_properties(self, volume, connector, hlu, sg_raw_output):
         storage_group = connector['host']
+        multipath = connector.get('multipath', False)
         owner_sp = self.get_lun_owner(volume)
         registered_spports = self._client.get_registered_spport_set(
             connector['initiator'],
             storage_group,
             sg_raw_output)
-        properties = {'target_discovered': True,
-                      'target_iqn': 'unknown',
-                      'target_portal': 'unknown',
-                      'target_lun': 'unknown',
-                      'volume_id': volume['id']}
-        target = self._client.find_avaialable_iscsi_target_one(
+        targets = self._client.find_available_iscsi_targets(
             storage_group, owner_sp,
             registered_spports,
-            self.iscsi_targets)
+            self.iscsi_targets,
+            multipath)
 
-        if target:
-            properties = {'target_discovered': True,
-                          'target_iqn': target['Port WWN'],
-                          'target_portal': "%s:3260" % target['IP Address'],
-                          'target_lun': hlu}
-            LOG.debug("iSCSI Properties: %s", properties)
-            auth = volume['provider_auth']
-            if auth:
-                (auth_method, auth_username, auth_secret) = auth.split()
-                properties['auth_method'] = auth_method
-                properties['auth_username'] = auth_username
-                properties['auth_password'] = auth_secret
+        properties = {}
+
+        if not multipath:
+            properties = {'target_discovered': False,
+                          'target_iqn': 'unknown',
+                          'target_portal': 'unknown',
+                          'target_lun': 'unknown',
+                          'volume_id': volume['id']}
+            if targets:
+                properties['target_discovered'] = True
+                properties['target_iqn'] = targets[0]['Port WWN']
+                properties['target_portal'] = \
+                    "%s:3260" % targets[0]['IP Address']
+                properties['target_lun'] = hlu
         else:
-            LOG.error(_LE('Failed to find an available iSCSI targets for %s.'),
+            properties = {'target_discovered': False,
+                          'target_iqns': None,
+                          'target_portals': None,
+                          'target_luns': None,
+                          'volume_id': volume['id']}
+            if targets:
+                properties['target_discovered'] = True
+                properties['target_iqns'] = [t['Port WWN'] for t in targets]
+                properties['target_portals'] = [
+                    "%s:3260" % t['IP Address'] for t in targets]
+                properties['target_luns'] = [hlu] * len(targets)
+
+        if not targets:
+            LOG.error(_LE('Failed to find available iSCSI targets for %s.'),
                       storage_group)
-        if self.multi_portals:
-            portals = []
-            iqns = []
-            for sp in self.iscsi_targets:
-                for one_target in self.iscsi_targets[sp]:
-                    portals.append("%s:3260" % one_target['IP Address'])
-                    iqns.append(one_target['Port WWN'])
-            properties['target_iqns'] = iqns
-            properties['target_portals'] = portals
 
         return properties
 
@@ -2747,122 +2936,54 @@ class EMCVnxCliBase(object):
                          'target_dicovered': True,
                          'target_wwn': None}
         if self.zonemanager_lookup_service is None:
-            fc_properties['target_wwn'] = self.get_login_ports(connector)
+            fc_properties['target_wwn'] = self.get_login_ports(connector,
+                                                               self.io_ports)
         else:
             target_wwns, itor_tgt_map = self.get_initiator_target_map(
-                connector)
+                connector['wwpns'],
+                self.get_status_up_ports(connector, self.io_ports))
             fc_properties['target_wwn'] = target_wwns
             fc_properties['initiator_target_map'] = itor_tgt_map
         return fc_properties
 
     def initialize_connection(self, volume, connector):
-        volume_metadata = {}
-        for metadata in volume['volume_admin_metadata']:
-            volume_metadata[metadata['key']] = metadata['value']
-        access_mode = volume_metadata.get('attached_mode')
-        if access_mode is None:
-            access_mode = ('ro'
-                           if volume_metadata.get('readonly') == 'True'
-                           else 'rw')
-        LOG.debug('Volume %(vol)s Access mode is: %(access)s.',
-                  {'vol': volume['name'],
-                   'access': access_mode})
-
-        (device_number, sg_data) = self.do_initialize_connection(volume,
-                                                                 connector)
+        """Initializes the connection and returns connection info."""
+        @lockutils.synchronized('emc-connection-' + connector['host'],
+                                "emc-connection-", True)
+        def do_initialize_connection():
+            return self.assure_host_access(
+                volume, connector)
 
         if self.protocol == 'iSCSI':
+            (device_number, sg_data) = do_initialize_connection()
             iscsi_properties = self.vnx_get_iscsi_properties(
                 volume,
                 connector,
                 device_number,
                 sg_data['raw_output']
             )
-            iscsi_properties['access_mode'] = access_mode
             data = {'driver_volume_type': 'iscsi',
                     'data': iscsi_properties}
         elif self.protocol == 'FC':
+            (device_number, sg_data) = do_initialize_connection()
             fc_properties = self.vnx_get_fc_properties(connector,
                                                        device_number)
             fc_properties['volume_id'] = volume['id']
-            fc_properties['access_mode'] = access_mode
             data = {'driver_volume_type': 'fibre_channel',
                     'data': fc_properties}
 
         return data
 
-    @log_enter_exit
-    def _do_initialize_connection(self, volume, connector):
-        """Initializes the connection and returns connection info."""
-        @lockutils.synchronized('emc-connection-' + connector['host']
-                                + self.get_array_serial(),
-                                "emc-connection-", True)
-        def inner_with_lock():
-            return self.assure_host_access(volume, connector)
-        return inner_with_lock()
-
-    @log_enter_exit
-    def _do_initialize_connection_in_batch(self, volume, connector):
-        hostname = connector['host']
-        alu = self.get_lun_id(volume)
-        order = Order(alu, True)
-        worker = self.get_batch_worker(connector)
-        worker.submit(order)
-        while (order.status == AddHluStatus.NEW):
-            LOG.debug("Add HLU order for volume %s is in "
-                      "waiting status." % volume['name'])
-            eventlet.sleep(BATCH_CHECK_INTERVAL)
-        LOG.debug("An add HLU order for %s is processed.",
-                  volume['name'])
-        if order.status == AddHluStatus.OK:
-            return order.hlu, order.payload
-        elif order.status == AddHluStatus.NO_HLU_LEFT:
-            msg = (_('Reach limitation set by configuration '
-                     'option max_luns_per_storage_group. '
-                     'Operation to add %(vol)s into '
-                     'Storage Group %(sg)s is rejected.')
-                   % {'vol': volume['name'], 'sg': hostname})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-        elif order.status == AddHluStatus.ABANDON:
-            msg = (_("Didn't add %(vol)s into %(sg)s because there is "
-                     "new request to remove %(vol)s from %(sg)s.")
-                   % {'vol': volume['name'],
-                      'sg': hostname})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-        else:
-            msg = (_("Failed to add %(vol)s into %(sg)s.")
-                   % {'vol': volume['name'],
-                      'sg': hostname})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-
     def terminate_connection(self, volume, connector):
-        fc_itor_tgt_map = self.do_terminate_connection(volume, connector)
-        if self.protocol == 'FC':
-            conn_info = {'driver_volume_type': 'fibre_channel',
-                         'data': {}}
-            if fc_itor_tgt_map:
-                conn_info['data']['initiator_target_map'] = fc_itor_tgt_map
-            return conn_info
-        else:
-            return
-
-    @log_enter_exit
-    def _do_terminate_connection(self, volume, connector):
-        """Disallow connection from connector.
-
-        Return the initiator target map if the fc zone need to be removed
-        """
-        @lockutils.synchronized('emc-connection-' + connector['host']
-                                + self.get_array_serial(), True)
-        def inner_with_lock():
+        """Disallow connection from connector."""
+        @lockutils.synchronized('emc-connection-' + connector['host'],
+                                "emc-connection-", True)
+        def do_terminate_connection():
             hostname = connector['host']
             volume_name = volume['name']
             lun_id = self.get_lun_id(volume)
             lun_map = None
-            fc_initiator_target_map = None
+            conn_info = None
             if (hostname in self.hlu_cache and
                     lun_id in self.hlu_cache[hostname] and
                     not self.destroy_empty_sg and
@@ -2876,7 +2997,7 @@ class EMCVnxCliBase(object):
                     lun_map = self.get_lun_map(hostname)
                     self.hlu_cache[hostname] = lun_map
                 except exception.EMCVnxCLICmdError as ex:
-                    if ex.rc == 83:
+                    if ex.kwargs["rc"] == 83:
                         LOG.warning(_LW("Storage Group %s is not found. "
                                         "terminate_connection() is "
                                         "unnecessary."),
@@ -2891,10 +3012,13 @@ class EMCVnxCliBase(object):
                                 {'vol': volume_name, 'sg': hostname})
 
             if self.protocol == 'FC':
+                conn_info = {'driver_volume_type': 'fibre_channel',
+                             'data': {}}
                 if self.zonemanager_lookup_service and not lun_map:
                     target_wwns, itor_tgt_map = self.get_initiator_target_map(
-                        connector)
-                    fc_initiator_target_map = itor_tgt_map
+                        connector['wwpns'],
+                        self.get_status_up_ports(connector))
+                    conn_info['data']['initiator_target_map'] = itor_tgt_map
 
             if self.destroy_empty_sg and not lun_map:
                 try:
@@ -2912,63 +3036,10 @@ class EMCVnxCliBase(object):
                             hostname, hostname)
                     except Exception:
                         LOG.warning(_LW("Fail to connect host %(host)s "
-                                        "back to storage group %(sg)s"),
+                                        "back to storage group %(sg)s."),
                                     {'host': hostname, 'sg': hostname})
-            return fc_initiator_target_map
-        return inner_with_lock()
-
-    @log_enter_exit
-    def _do_terminate_connection_in_batch(self, volume, connector):
-        """Disallow connection from connector in batch.
-
-        Return the initiator target map if the fc zone need to be removed
-        """
-        hostname = connector['host']
-        alu = self.get_lun_id(volume)
-        worker = self.get_batch_worker(connector)
-        order = Order(alu, False)
-        worker.submit(order)
-        while (order.status == RemoveHluStatus.NEW):
-            LOG.debug("Remove HLU order for volume %s is in "
-                      "waiting status." % volume['name'])
-            eventlet.sleep(BATCH_CHECK_INTERVAL)
-        LOG.debug("Remove HLU order for %s is processed.",
-                  volume['name'])
-        if order.status == RemoveHluStatus.OK:
-            return order.payload
-        elif (order.status == RemoveHluStatus.HLU_NOT_IN_SG):
-            LOG.debug("Volume %(volname)s is not in storagegroup"
-                      " %(sgname)s."
-                      % {'volname': volume['name'],
-                         'sgname': hostname})
-            return order.payload
-        elif order.status == RemoveHluStatus.ABANDON:
-            msg = (_("Didn't remove %(vol)s from %(sg)s because there is "
-                     "new request to add %(vol)s into %(sg)s.")
-                   % {'vol': volume['name'],
-                      'sg': hostname})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-        else:
-            msg = (_("Failed to remove %(vol)s from %(sg)s.")
-                   % {'vol': volume['name'],
-                      'sg': hostname})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
-
-    def get_batch_worker(self, connector):
-        hostname = connector['host']
-
-        @lockutils.synchronized('emc-get-batch-worker' + hostname,
-                                'emc-get-batch-worker', False)
-        def inner_with_lock():
-            if hostname not in self.addhlu_workers:
-                self.addhlu_workers[hostname] = BatchAttachDetachBatchWorker(
-                    self,
-                    connector,
-                    self.attach_detach_batch_interval)
-            return self.addhlu_workers[hostname]
-        return inner_with_lock()
+            return conn_info
+        return do_terminate_connection()
 
     def manage_existing_get_size(self, volume, ref):
         """Returns size of volume to be managed by manage_existing."""
@@ -3022,27 +3093,20 @@ class EMCVnxCliBase(object):
         """Returns the iSCSI initiators for a SP."""
         return self._client.get_iscsi_protocol_endpoints(device_sp)
 
-    def get_login_ports(self, connector):
+    def get_login_ports(self, connector, io_ports=None):
         return self._client.get_login_ports(connector['host'],
-                                            connector['wwpns'])
+                                            connector['wwpns'],
+                                            io_ports)
 
-    def get_status_up_ports(self, connector, poll=True, sgdata=None):
+    def get_status_up_ports(self, connector, io_ports=None):
         return self._client.get_status_up_ports(connector['host'],
-                                                poll=poll,
-                                                sgdata=sgdata)
+                                                io_ports=io_ports)
 
-    def get_initiator_target_map(self, connector, poll=True, sgdata=None):
-        if not self.zonemanager_lookup_service:
-            # if fc auto zoning is not enalbed
-            return [], {}
-        else:
-            target_wwns = []
-            itor_tgt_map = {}
+    def get_initiator_target_map(self, fc_initiators, fc_targets):
+        target_wwns = []
+        itor_tgt_map = {}
 
-            fc_initiators = connector['wwpns']
-            fc_targets = self.get_status_up_ports(connector,
-                                                  poll,
-                                                  sgdata)
+        if self.zonemanager_lookup_service:
             mapping = \
                 self.zonemanager_lookup_service. \
                 get_device_mapping_from_network(fc_initiators, fc_targets)
@@ -3069,6 +3133,10 @@ class EMCVnxCliBase(object):
                                             [self._client.LUN_POOL],
                                             poll=False)
         return data.get(self._client.LUN_POOL.key)
+
+    def unmanage(self, volume):
+        """Unmanages a volume"""
+        pass
 
 
 @decorate_all_methods(log_enter_exit)
@@ -3300,376 +3368,3 @@ class CreateSnapshotTask(task.Task):
                                 'delete temp snapshot %s'),
                             snapshot['name'])
                 client.delete_snapshot(snapshot['name'])
-
-
-class BatchAttachDetachBatchWorker(queueworker.BatchWorkerBase):
-    """This worker processes the Attach Detach orders in batch."""
-    def __init__(self, clihelper, connector, sleep_interval=10):
-        super(BatchAttachDetachBatchWorker, self).__init__(sleep_interval)
-        self.cli = clihelper
-        self.connector = connector
-        self.has_add_order = False
-        self.sgdata = None
-        self.is_fc_auto_zone = (
-            self.cli.protocol == 'FC' and
-            self.cli.zonemanager_lookup_service is not None)
-        self.array_serial = self.cli.get_array_serial()
-
-    def execute(self, orders):
-        try:
-            self._execute(orders)
-        except Exception as ex:
-            msg = _LE("Attach/Detach Volume in batch error. %s") % ex
-            LOG.error(msg)
-            for order in orders:
-                if not order.processed:
-                    order.update_status(queueworker.Status.FAILURE,
-                                        msg=msg)
-            return
-
-    @log_enter_exit
-    def _execute(self, orders):
-        LOG.debug("Get %(lens)s orders for %(sg)s",
-                  {'lens': len(orders),
-                   'sg': self.connector['host']})
-        add_ordermap, remove_ordermap = self._triage_orders(orders)
-
-        connector = self.connector
-        if add_ordermap:
-            # As long as there is add order we can predict that the
-            # Storagegroup will not be empty after this run
-            self.has_add_order = True
-            sgdata = self.cli._prepare_storage_group(connector)
-        else:
-            # If there there is no add order, then we do not need to ensure the
-            # existance of SG
-            self.has_add_order = False
-            try:
-                sgdata = self.cli._client.get_storage_group(connector['host'])
-            except exception.EMCVnxCLICmdError as ex:
-                with excutils.save_and_reraise_exception(
-                        reraise= (ex.rc != 83)):
-                    if ex.rc == 83:
-                        LOG.warning(_LW("Storage Group %s is not found. "
-                                        "terminate_connection() is "
-                                        "unnecessary."),
-                                    connector['host'])
-                        for alu in remove_ordermap:
-                            LOG.debug("LUN %s is not in the storage "
-                                      "group.", alu)
-                            for order in orders:
-                                order.update_status(
-                                    RemoveHluStatus.HLU_NOT_IN_SG,
-                                    msg='Storage Group is not found')
-        if add_ordermap:
-            self._process_add_orders(add_ordermap, sgdata)
-
-        if remove_ordermap:
-            representative_remove_order = self._process_remove_orders(
-                remove_ordermap, sgdata)
-
-            if (self._need_special_handling_when_sg_is_empty() and
-                    not add_ordermap):
-                # Predict that if there is add order to be processed
-                # then the storage group will not be empty
-                self._process_when_sg_is_empty(sgdata,
-                                               connector,
-                                               representative_remove_order)
-
-    def _triage_orders(self, orders):
-        """Merge the duplucated orders and remove the abandoned orders.
-
-        :RETURN: (Effective add order map, effective remove order map).
-                 These 2 map use alu as the key, and use the corresponding
-                 orders list as the value
-        """
-        add_ordermap = {}
-        remove_ordermap = {}
-        for order in orders:
-            alu = order.alu
-            if order.is_add_order:
-                if alu in remove_ordermap:
-                    LOG.debug("There is different order type for alu %s, "
-                              "the orders in old type will be abandoned.",
-                              alu)
-
-                    for item in remove_ordermap[alu]:
-                        item.update_status(queueworker.Status.ABANDON)
-                    del remove_ordermap[alu]
-
-                add_ordermap.setdefault(alu, []).append(order)
-
-            else:
-                if alu in add_ordermap:
-                    LOG.debug("There is different order type for alu %s, "
-                              "the orders in old type will be abandoned.",
-                              alu)
-                    for item in add_ordermap[alu]:
-                        item.update_status(queueworker.Status.ABANDON)
-                    del add_ordermap[alu]
-
-                remove_ordermap.setdefault(alu, []).append(order)
-
-        return add_ordermap, remove_ordermap
-
-    def _process_add_orders(self, ordermap, sgdata):
-        """Processes remove orders."""
-        addalus = []
-        addhlus = []
-        add_ordermap = {}
-
-        lunmap = sgdata['lunmap']
-        used_hlus = lunmap.values()
-        candidate_hlus = list(self.cli.filter_available_hlu_set(used_hlus))
-        random.shuffle(candidate_hlus)
-
-        for alu in ordermap:
-            orders = ordermap[alu]
-            if alu in lunmap:
-                LOG.debug("LUN %(alu)s is already in storage group %(sg)s.",
-                          {'alu': alu,
-                           'sg': self.connector['host']})
-                for order in orders:
-                    order.update_status(AddHluStatus.OK,
-                                        hlu=lunmap[alu],
-                                        payload=sgdata)
-            elif candidate_hlus:
-                addalus.append(alu)
-                hlu = candidate_hlus.pop()
-                addhlus.append(hlu)
-                add_ordermap[alu] = {'orders': orders,
-                                     'hlu': hlu}
-            else:
-                # No hlu left
-                for order in orders:
-                    order.update_status(AddHluStatus.NO_HLU_LEFT)
-
-        self._execute_addhlu(addalus, addhlus, add_ordermap, sgdata)
-
-    def _execute_addhlu(self, alus, hlus, alu_ordermap, sgdata):
-        if len(alus) == 0:
-            LOG.debug("No add order needs to be handled.")
-            return
-
-        # If special handling when SG is empty is required,
-        # Add alu need to wait for connection lock in case
-        # LUN is added into SG during the SG empty handling
-        (succeed_set, failed_set) = self._add_hlus_to_storagegroup(
-            hlus, alus, self._need_special_handling_when_sg_is_empty())
-
-        for alu in succeed_set:
-            map_item = alu_ordermap.pop(alu)
-            for order in map_item['orders']:
-                order.update_status(AddHluStatus.OK,
-                                    hlu=map_item['hlu'],
-                                    payload=sgdata)
-
-        for alu in failed_set:
-            map_item = alu_ordermap.pop(alu)
-            for order in map_item['orders']:
-                if order.tried + 1 >= self.cli.max_retries:
-                    # Excced Max Retry, mark status to Failure
-                    order.update_status(AddHluStatus.FAILURE)
-                else:
-                    order.tried = order.tried + 1
-                    self.submit(order)
-
-    def _process_remove_orders(self, ordermap, sgdata):
-        """Processes remove orders.
-
-        If fc auto zoning is enabled, the status of one of successfully
-        processed order(remove hlus is executed) will not be updated and it
-        will be returned to the caller directly.
-
-        :RETURN: Order that is handled without status updates
-        """
-
-        removehlus = []
-        remove_ordermap = {}
-
-        lunmap = sgdata['lunmap']
-
-        for alu in ordermap:
-            orders = ordermap[alu]
-            if alu not in lunmap:
-                LOG.debug("LUN %(alu)s is not in the storage group %(sg)s.",
-                          {'alu': alu, 'sg': self.connector['host']})
-                for order in orders:
-                    order.update_status(RemoveHluStatus.HLU_NOT_IN_SG)
-            else:
-                hlu = lunmap[alu]
-                removehlus.append(hlu)
-                remove_ordermap[hlu] = {'orders': orders}
-
-        return self._execute_removehlu(removehlus, remove_ordermap, sgdata)
-
-    def _execute_removehlu(self, hlus, hlu_ordermap, sgdata):
-        """Removes hlus in batch.
-
-        If fc auto zoning is enabled, the status of one successfully handled
-        order will not be changed and returned directly.
-        """
-
-        if len(hlus) == 0:
-            return
-
-        (succeed_set, failed_set) = (
-            self.cli._client.remove_hlus_from_storage_group(
-                hlus, self.connector['host']))
-
-        for hlu in failed_set:
-            map_item = hlu_ordermap.pop(hlu)
-            for order in map_item['orders']:
-                if order.tried + 1 >= 2:
-                    # Mark status to Failure in retry
-                    order.update_status(RemoveHluStatus.FAILURE)
-                else:
-                    # Resubmit the order because we are didn't using pool
-                    # in hlu removal. The LUN maybe already removed
-                    order.tried = order.tried + 1
-                    self.submit(order)
-
-        if succeed_set:
-            succeed_list = list(succeed_set)
-            representative_order = None
-            if self.is_fc_auto_zone and not self.has_add_order:
-                # We have to add the zoning information in payload of
-                # one order when storage becomes empty, so leave one
-                # order without updating status.
-                onehlu = succeed_list[len(succeed_list) - 1]
-                representative_order = hlu_ordermap[onehlu]['orders'].pop()
-
-            for hlu in succeed_list:
-                map_item = hlu_ordermap.pop(hlu)
-                for order in map_item['orders']:
-                    order.update_status(RemoveHluStatus.OK)
-            return representative_order
-        return None
-
-    def _process_when_sg_is_empty(self, sgdata, connector, order=None):
-        """Removes Storage group and builds zone mapping when necessary.
-
-        When storage group becomes to be empty, this method will removes
-        storage group if auto remove storage group is enabled, and builds
-        zone mapping information if FC auto zoning is enalbed. The zone
-        mapping information will be stored in order.payload.
-        """
-        host = connector['host']
-
-        @lockutils.synchronized('emc-connection-' + host
-                                + self.cli.get_array_serial(),
-                                'emc-connection-', True)
-        def inner_with_lock():
-            try:
-                storage_group = self.cli._client.get_storage_group(host)
-            except exception.EMCVnxCLICmdError as ex:
-                if ex.rc == 83:
-                    LOG.debug("Storage Group %s is not found. ",
-                              host)
-                    if order:
-                        order.update_status(RemoveHluStatus.OK)
-                else:
-                    LOG.warning(_LW('Error happened on querying Storage group '
-                                    '%(sg)s after removing LUN %(alu)s from '
-                                    'it. Please check the status of the '
-                                    'Storage group on VNX.'),
-                                {'sg': host,
-                                 'alu': order.alu})
-                    if order:
-                        order.update_status(RemoveHluStatus.OK)
-
-            lun_map = storage_group['lunmap']
-            if lun_map:
-                # SG is not empty, just mask the order as OK
-                if order:
-                    order.update_status(RemoveHluStatus.OK)
-            else:
-                if order:
-                    # SG is empty, build initiator map for Zoning removal
-                    target_wwns, itor_tgt_map = (
-                        self.cli.get_initiator_target_map(
-                            connector, False, storage_group['raw_output']))
-
-                    order.update_status(RemoveHluStatus.OK,
-                                        payload=itor_tgt_map)
-
-                if self.cli.destroy_empty_sg:
-                    try:
-                        LOG.info(_LI('Storage Group %s was empty.'), host)
-                        self.cli._client.disconnect_host_from_storage_group(
-                            host, host)
-                        self.cli._client.delete_storage_group(host)
-                        if self.cli.itor_auto_dereg:
-                            self.cli._deregister_initiators(connector)
-                    except Exception:
-                        LOG.warning(_LW('Failed to destroy Storage Group %s.'),
-                                    host)
-                        try:
-                            self.cli._client.connect_host_to_storage_group(
-                                host, host)
-                        except Exception:
-                            LOG.warning(_LW('Failed to connect host back to '
-                                            'storage group %s.'),
-                                        host)
-        inner_with_lock()
-
-    def submit(self, order):
-        """Adds a order into execution queue."""
-
-        order.prepare_submit()
-        super(BatchAttachDetachBatchWorker, self).submit(order)
-
-    def _need_special_handling_when_sg_is_empty(self):
-        return (self.is_fc_auto_zone or self.cli.destroy_empty_sg)
-
-    def _add_hlus_to_storagegroup(self, hlus, alus, need_lock=False):
-        hostname = self.connector['host']
-        if not need_lock:
-            return self.cli._client.add_hlus_to_storage_group(
-                hlus, alus, hostname)
-        else:
-            @lockutils.synchronized('emc-connection-' + hostname
-                                    + self.array_serial,
-                                    'emc-connection-', True)
-            def inner_with_lock():
-                return self.cli._client.add_hlus_to_storage_group(
-                    hlus, alus, hostname)
-            return inner_with_lock()
-
-
-class Order(object):
-    """Represents a Batch Attach or Detach Order."""
-
-    TYPE_ADD = 0
-    TYPE_REMOVE = 1
-
-    def __init__(self, alu, is_add):
-        """Generates a Batch Order, either Add order Remove order."""
-
-        self.alu = alu
-        self.type = Order.TYPE_ADD if is_add else Order.TYPE_REMOVE
-        self.is_add_order = is_add
-        self.status = RemoveHluStatus.NEW
-        self.tried = 0
-        self.hlu = None
-        self.msg = ''
-        self.payload = None
-        self.processed = False
-
-    def update_status(self, newstatus, hlu=None, msg='', payload=None):
-        self.tried += 1
-        self.processed = True
-        self.msg = msg
-        self.payload = payload
-        self.hlu = hlu
-        # Note: self.status should be the last member variable to be udpated.
-        self.status = newstatus
-
-    def prepare_submit(self):
-        """Prepares the order for resubmission."""
-        self.processed = False
-
-    def __str__(self):
-        return ",".join(["%(key)s: %(value)s" % {'key': property,
-                                                 'value': value}
-                        for property, value in vars(self).iteritems()])

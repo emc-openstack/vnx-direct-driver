@@ -16,23 +16,24 @@ import os
 import re
 
 import mock
+from oslo_concurrency import processutils
 
 from cinder import exception
-from cinder.openstack.common import processutils
 from cinder import test
+from cinder.tests import utils
 from cinder.volume import configuration as conf
-from cinder.volume.drivers.emc.emc_cli_fc import EMCCLIFCDriver
-from cinder.volume.drivers.emc.emc_cli_iscsi import EMCCLIISCSIDriver
-import cinder.volume.drivers.emc.emc_vnx_cli as emc_vnx_cli
-from cinder.volume.drivers.emc.emc_vnx_cli import CommandLineHelper
-from cinder.zonemanager.fc_san_lookup_service import FCSanLookupService
+from cinder.volume.drivers.emc import emc_cli_fc
+from cinder.volume.drivers.emc import emc_cli_iscsi
+from cinder.volume.drivers.emc import emc_vnx_cli
+from cinder.zonemanager import fc_san_lookup_service as fc_service
+
 
 SUCCEED = ("", 0)
 FAKE_ERROR_RETURN = ("FAKE ERROR", 255)
 VERSION = emc_vnx_cli.EMCVnxCliBase.VERSION
 
 
-class EMCVNXCLIDriverTestData():
+class EMCVNXCLIDriverTestData(object):
 
     test_volume = {
         'name': 'vol1',
@@ -42,12 +43,11 @@ class EMCVNXCLIDriverTestData():
         'provider_auth': None,
         'host': "host@backendsec#unit_test_pool",
         'project_id': 'project',
-        'provider_location': 'system^FNM11111|type^lun|id^1|version^04.02.00',
+        'provider_location': 'system^FNM11111|type^lun|id^1|version^05.03.00',
         'display_name': 'vol1',
         'display_description': 'test volume',
         'volume_type_id': None,
-        'consistencygroup_id': None,
-        'volume_admin_metadata': [{'key': 'readonly', 'value': 'True'}]
+        'consistencygroup_id': None
     }
 
     test_legacy_volume = {
@@ -62,8 +62,7 @@ class EMCVNXCLIDriverTestData():
         'display_name': 'vol1',
         'display_description': 'test volume',
         'volume_type_id': None,
-        'consistencygroup_id': None,
-        'volume_admin_metadata': [{'key': 'readonly', 'value': 'True'}]
+        'consistencygroup_id': None
     }
 
     test_volume_clone_cg = {
@@ -77,8 +76,7 @@ class EMCVNXCLIDriverTestData():
         'display_name': 'vol1',
         'display_description': 'test volume',
         'volume_type_id': None,
-        'consistencygroup_id': None,
-        'volume_admin_metadata': [{'key': 'readonly', 'value': 'True'}]
+        'consistencygroup_id': None
     }
 
     test_volume_cg = {
@@ -92,8 +90,7 @@ class EMCVNXCLIDriverTestData():
         'display_name': 'vol1',
         'display_description': 'test volume',
         'volume_type_id': None,
-        'consistencygroup_id': 'cg_id',
-        'volume_admin_metadata': [{'key': 'readonly', 'value': 'True'}]
+        'consistencygroup_id': 'cg_id'
     }
 
     test_volume_rw = {
@@ -108,9 +105,7 @@ class EMCVNXCLIDriverTestData():
         'display_description': 'test volume',
         'volume_type_id': None,
         'consistencygroup_id': None,
-        'volume_admin_metadata': [{'key': 'attached_mode', 'value': 'rw'},
-                                  {'key': 'readonly', 'value': 'False'}],
-        'provider_location': 'system^FNM11111|type^lun|id^1|version^04.02.00',
+        'provider_location': 'system^FNM11111|type^lun|id^1|version^05.03.00'
     }
 
     test_volume2 = {
@@ -134,8 +129,22 @@ class EMCVNXCLIDriverTestData():
         'provider_auth': None,
         'host': "host@backendsec#unit_test_pool",
         'project_id': 'project',
-        'display_name': 'vol2',
-        'consistencygroup_id': None,
+        'display_name': 'vol1_in_cg',
+        'provider_location': 'system^FNM11111|type^lun|id^1',
+        'consistencygroup_id': 'consistencygroup_id',
+        'display_description': 'test volume',
+        'volume_type_id': None}
+
+    volume2_in_cg = {
+        'name': 'vol2',
+        'size': 1,
+        'volume_name': 'vol2',
+        'id': '3',
+        'provider_auth': None,
+        'project_id': 'project',
+        'display_name': 'vol2_in_cg',
+        'provider_location': 'system^FNM11111|type^lun|id^3',
+        'consistencygroup_id': 'consistencygroup_id',
         'display_description': 'test volume',
         'volume_type_id': None}
 
@@ -176,7 +185,7 @@ class EMCVNXCLIDriverTestData():
         'display_name': 'failed_vol',
         'display_description': 'Volume 1 in SG',
         'volume_type_id': None,
-        'provider_location': 'system^fakesn|type^lun|id^4|version^04.02.00'}
+        'provider_location': 'system^fakesn|type^lun|id^4|version^05.03.00'}
 
     test_volume2_in_sg = {
         'name': 'vol2_in_sg',
@@ -189,7 +198,7 @@ class EMCVNXCLIDriverTestData():
         'display_name': 'failed_vol',
         'display_description': 'Volume 2 in SG',
         'volume_type_id': None,
-        'provider_location': 'system^fakesn|type^lun|id^3|version^04.02.00'}
+        'provider_location': 'system^fakesn|type^lun|id^3|version^05.03.00'}
 
     test_snapshot = {
         'name': 'snapshot1',
@@ -251,12 +260,12 @@ class EMCVNXCLIDriverTestData():
         'deleted': False,
         'host': "host@backendsec#unit_test_pool",
         'source_volid': None, 'provider_auth': None,
-        'display_name': 'vol-test02', 'instance_uuid': None,
+        'display_name': 'vol-test02',
         'attach_status': 'detached',
         'volume_type': [],
-        'attached_host': None,
+        'volume_attachment': [],
         'provider_location':
-        'system^FNM11111|type^lun|id^1|version^04.02.00',
+        'system^FNM11111|type^lun|id^1|version^05.03.00',
         '_name_id': None, 'volume_metadata': []}
 
     test_new_type = {'name': 'voltype0', 'qos_specs_id': None,
@@ -275,6 +284,24 @@ class EMCVNXCLIDriverTestData():
                   'volume_backend_name': 'pool_backend_1',
                   'storage_protocol': 'iSCSI'}}
 
+    test_volume4 = {'migration_status': None, 'availability_zone': 'nova',
+                    'id': '1181d1b2-cea3-4f55-8fa8-3360d026ce24',
+                    'name': 'vol4',
+                    'size': 2L,
+                    'volume_admin_metadata': [],
+                    'status': 'available',
+                    'volume_type_id':
+                    '19fdd0dd-03b3-4d7c-b541-f4df46f308c8',
+                    'deleted': False, 'provider_location':
+                    'system^FNM11111|type^lun|id^4',
+                    'host': 'ubuntu-server12@array_backend_1',
+                    'source_volid': None, 'provider_auth': None,
+                    'display_name': 'vol-test02',
+                    'volume_attachment': [],
+                    'attach_status': 'detached',
+                    'volume_type': [],
+                    '_name_id': None, 'volume_metadata': []}
+
     test_volume5 = {'migration_status': None, 'availability_zone': 'nova',
                     'id': '1181d1b2-cea3-4f55-8fa8-3360d026ce25',
                     'name_id': '1181d1b2-cea3-4f55-8fa8-3360d026ce25',
@@ -285,10 +312,11 @@ class EMCVNXCLIDriverTestData():
                     'volume_type_id':
                     '19fdd0dd-03b3-4d7c-b541-f4df46f308c8',
                     'deleted': False, 'provider_location':
-                    'system^FNM11111|type^lun|id^5|version^04.02.00',
+                    'system^FNM11111|type^lun|id^5|version^05.02.00',
                     'host': 'ubuntu-server12@array_backend_1#unit_test_pool',
                     'source_volid': None, 'provider_auth': None,
-                    'display_name': 'vol-test05', 'instance_uuid': None,
+                    'display_name': 'vol-test05',
+                    'volume_attachment': [],
                     'attach_status': 'detached',
                     'volume_type': [],
                     '_name_id': None, 'volume_metadata': []}
@@ -312,6 +340,13 @@ class EMCVNXCLIDriverTestData():
                'name': 'group_name',
                'status': 'deleting'}
 
+    test_cg_with_type = {'id': 'consistencygroup_id',
+                         'name': 'group_name',
+                         'status': 'creating',
+                         'volume_type_id':
+                         'abc1-2320-9013-8813-8941-1374-8112-1231,'
+                         '19fdd0dd-03b3-4d7c-b541-f4df46f308c8,'}
+
     test_cgsnapshot = {
         'consistencygroup_id': 'consistencygroup_id',
         'id': 'cgsnapshot_id',
@@ -331,7 +366,7 @@ class EMCVNXCLIDriverTestData():
 
     test_lun_id = 1
     test_existing_ref = {'id': test_lun_id}
-    test_pool_name = 'Pool_02_SASFLASH'
+    test_pool_name = 'unit_test_pool'
     device_map = {
         '1122334455667788': {
             'initiator_port_wwn_list': ['123456789012345', '123456789054321'],
@@ -395,6 +430,9 @@ class EMCVNXCLIDriverTestData():
                        "Name of the software package:   -VNXSnapshots",
                        0)
 
+    NDU_LIST_RESULT_WO_LICENSE = (
+        "Name of the software package:   -Unisphere ",
+        0)
     MIGRATE_PROPERTY_MIGRATING = """\
         Source LU Name:  volume-f6247ae1-8e1c-4927-aa7e-7f8e272e5c3d
         Source LU ID:  63950
@@ -415,10 +453,6 @@ class EMCVNXCLIDriverTestData():
         Percent Complete:  60
         Time Remaining:  0 second(s)
         """
-
-    NDU_LIST_RESULT_WO_LICENSE = (
-        "Name of the software package:   -Unisphere ",
-        0)
 
     def SNAP_MP_CREATE_CMD(self, name='vol1', source='vol1'):
         return ('lun', '-create', '-type', 'snap', '-primaryLunName',
@@ -544,11 +578,8 @@ class EMCVNXCLIDriverTestData():
         return ('-np', 'snap', '-group', '-destroy',
                 '-id', cg_name)
 
-    def GET_CONSISTENCYGROUP_BY_NAME(self, cg_name):
-        return ('snap', '-group', '-list', '-id', cg_name)
-
     def ADD_LUN_TO_CG_CMD(self, cg_name, lun_id):
-        return ('-np', 'snap', '-group',
+        return ('snap', '-group',
                 '-addmember', '-id', cg_name, '-res', lun_id)
 
     def CREATE_CG_SNAPSHOT(self, cg_name, snap_name):
@@ -562,6 +593,14 @@ class EMCVNXCLIDriverTestData():
     def GET_CG_BY_NAME_CMD(self, cg_name):
         return ('snap', '-group', '-list', '-id', cg_name)
 
+    def REMOVE_LUNS_FROM_CG_CMD(self, cg_name, remove_ids):
+        return ('snap', '-group', '-rmmember', '-id', cg_name, '-res',
+                ','.join(remove_ids))
+
+    def REPLACE_LUNS_IN_CG_CMD(self, cg_name, new_ids):
+        return ('snap', '-group', '-replmember', '-id', cg_name, '-res',
+                ','.join(new_ids))
+
     def CONSISTENCY_GROUP_VOLUMES(self):
         volumes = []
         volumes.append(self.test_volume)
@@ -574,6 +613,18 @@ class EMCVNXCLIDriverTestData():
         snaps.append(self.test_snapshot)
         return snaps
 
+    def VOLUMES_NOT_IN_CG(self):
+        add_volumes = []
+        add_volumes.append(self.test_volume4)
+        add_volumes.append(self.test_volume5)
+        return add_volumes
+
+    def VOLUMES_IN_CG(self):
+        remove_volumes = []
+        remove_volumes.append(self.volume_in_cg)
+        remove_volumes.append(self.volume2_in_cg)
+        return remove_volumes
+
     def CG_PROPERTY(self, cg_name):
         return """
 Name:  %(cg_name)s
@@ -581,7 +632,13 @@ Description:
 Allow auto delete:  No
 Member LUN ID(s):  1, 3
 State:  Ready
-""" % {'cg_name': cg_name}
+""" % {'cg_name': cg_name}, 0
+
+    def CG_REPL_ERROR(self):
+        return """
+        The specified LUN is already a member
+        of another consistency group. (0x716d8045)
+        """, 71
 
     POOL_PROPERTY = ("""\
 Pool Name:  unit_test_pool
@@ -612,24 +669,70 @@ Available Capacity (GBs):  3257.851
                  "SP:  A\n" +
                  "Port ID:  5\n" +
                  "Port WWN:  iqn.1992-04.com.emc:cx.fnm00124000215.a5\n" +
-                 "iSCSI Alias:  0215.a5\n", 0)
+                 "iSCSI Alias:  0215.a5\n" +
+                 "SP:  A\n" +
+                 "Port ID:  0\n" +
+                 "Port WWN:  iqn.1992-04.com.emc:cx.fnm00124000215.a0\n" +
+                 "iSCSI Alias:  0215.a0\n\n" +
+                 "Virtual Port ID:  0\n" +
+                 "VLAN ID:  Disabled\n" +
+                 "IP Address:  10.244.214.119\n\n" +
+                 "SP:  B\n" +
+                 "Port ID:  2\n" +
+                 "Port WWN:  iqn.1992-04.com.emc:cx.fnm00124000215.b2\n" +
+                 "iSCSI Alias:  0215.b2\n\n" +
+                 "Virtual Port ID:  0\n" +
+                 "VLAN ID:  Disabled\n" +
+                 "IP Address:  10.244.214.120\n\n", 0)
 
-    iscsi_connection_info_ro = \
-        {'data': {'access_mode': 'ro',
-                  'target_discovered': True,
+    WHITE_LIST_PORTS = ("""SP:  A
+Port ID:  0
+Port WWN:  iqn.1992-04.com.emc:cx.fnmxxx.a0
+iSCSI Alias:  0235.a7
+
+Virtual Port ID:  0
+VLAN ID:  Disabled
+IP Address:  192.168.3.52
+
+SP:  A
+Port ID:  9
+Port WWN:  iqn.1992-04.com.emc:cx.fnmxxx.a9
+iSCSI Alias:  0235.a9
+
+SP:  A
+Port ID:  4
+Port WWN:  iqn.1992-04.com.emc:cx.fnmxxx.a4
+iSCSI Alias:  0235.a4
+
+SP:  B
+Port ID:  2
+Port WWN:  iqn.1992-04.com.emc:cx.fnmxxx.b2
+iSCSI Alias:  0235.b6
+
+Virtual Port ID:  0
+VLAN ID:  Disabled
+IP Address:  192.168.4.53
+""", 0)
+
+    iscsi_connection_info = \
+        {'data': {'target_discovered': True,
                   'target_iqn':
                   'iqn.1992-04.com.emc:cx.fnm00124000215.a4',
                   'target_lun': 2,
-                  'target_portal': '10.244.214.118:3260'},
+                  'target_portal': '10.244.214.118:3260',
+                  'volume_id': '1'},
          'driver_volume_type': 'iscsi'}
 
-    iscsi_connection_info_rw = \
-        {'data': {'access_mode': 'rw',
-                  'target_discovered': True,
-                  'target_iqn':
-                  'iqn.1992-04.com.emc:cx.fnm00124000215.a4',
-                  'target_lun': 2,
-                  'target_portal': '10.244.214.118:3260'},
+    iscsi_connection_info_mp = \
+        {'data': {'target_discovered': True,
+                  'target_iqns': [
+                      'iqn.1992-04.com.emc:cx.fnm00124000215.a4',
+                      'iqn.1992-04.com.emc:cx.fnm00124000215.a5'],
+                  'target_luns': [2, 2],
+                  'target_portals': [
+                      '10.244.214.118:3260',
+                      '10.244.214.119:3260'],
+                  'volume_id': '1'},
          'driver_volume_type': 'iscsi'}
 
     PING_OK = ("Reply from 10.0.0.2:  bytes=32 time=1ms TTL=30\n" +
@@ -664,7 +767,18 @@ Available Capacity (GBs):  3257.851
                 "50:06:01:62:08:60:01:95\n" +
                 "Link Status:         Down\n" +
                 "Port Status:         Online\n" +
-                "Switch Present:      NO\n", 0)
+                "Switch Present:      NO\n" +
+                "\n" +
+                "SP Name:             SP B\n" +
+                "SP Port ID:          2\n" +
+                "SP UID:              50:06:01:60:88:60:08:0F:"
+                "50:06:01:6A:08:60:08:0F\n" +
+                "Link Status:         Up\n" +
+                "Port Status:         Online\n" +
+                "Switch Present:      YES\n" +
+                "Switch UID:          10:00:50:EB:1A:03:3F:59:"
+                "20:11:50:EB:1A:03:3F:59\n" +
+                "SP Source ID:        69888\n", 0)
 
     FAKEHOST_PORTS = (
         "Information about each HBA:\n" +
@@ -693,6 +807,14 @@ Available Capacity (GBs):  3257.851
         "    Defined:               YES\n" +
         "    Initiator Type:           3\n" +
         "    StorageGroup Name:     fakehost\n\n" +
+        "    SP Name:               SP B\n" +
+        "    SP Port ID:            2\n" +
+        "    HBA Devicename:\n" +
+        "    Trusted:               NO\n" +
+        "    Logged In:             YES\n" +
+        "    Defined:               YES\n" +
+        "    Initiator Type:           3\n" +
+        "    StorageGroup Name:     fakehost\n\n"
         "Information about each SPPORT:\n" +
         "\n" +
         "SP Name:             SP A\n" +
@@ -720,34 +842,70 @@ Available Capacity (GBs):  3257.851
         "50:06:01:62:08:60:01:95\n" +
         "Link Status:         Down\n" +
         "Port Status:         Online\n" +
-        "Switch Present:      NO\n", 0)
+        "Switch Present:      NO\n" +
+        "\n" +
+        "SP Name:             SP B\n" +
+        "SP Port ID:          2\n" +
+        "SP UID:              50:06:01:60:88:60:01:95:" +
+        "50:06:01:6A:08:60:08:0F\n" +
+        "Link Status:         Up\n" +
+        "Port Status:         Online\n" +
+        "Switch Present:      YES\n" +
+        "Switch UID:          10:00:00:05:1E:72:EC:A6:" +
+        "20:46:00:05:1E:72:EC:A6\n" +
+        "SP Source ID:        272896\n", 0)
 
-    def LUN_PROPERTY(self, name, isThin=False, hasSnap=False, size=1):
-        return """\
+    def LUN_PROPERTY(self, name, is_thin=False, has_snap=False, size=1,
+                     state='Ready', faulted='false', operation='None'):
+        return ("""
                LOGICAL UNIT NUMBER 1
-               Name:  %s
+               Name:  %(name)s
                UID:  60:06:01:60:09:20:32:00:13:DF:B4:EF:C2:63:E3:11
                Current Owner:  SP A
                Default Owner:  SP A
                Allocation Owner:  SP A
-               Attached Snapshot: %s
+               Attached Snapshot: %(has_snap)s
                User Capacity (Blocks):  2101346304
-               User Capacity (GBs):  %d
+               User Capacity (GBs):  %(size)d
                Consumed Capacity (Blocks):  2149576704
                Consumed Capacity (GBs):  1024.998
-               Pool Name:  Pool_02_SASFLASH
-               Current State:  Ready
+               Pool Name:  unit_test_pool
+               Current State:  %(state)s
                Status:  OK(0x0)
-               Is Faulted:  false
+               Is Faulted:  %(faulted)s
                Is Transitioning:  false
-               Current Operation:  None
+               Current Operation:  %(operation)s
                Current Operation State:  N/A
                Current Operation Status:  N/A
                Current Operation Percent Completed:  0
-               Is Thin LUN:  %s""" % (name,
-                                      'FakeSnap' if hasSnap else 'N/A',
-                                      size,
-                                      'Yes' if isThin else 'No'), 0
+               Is Thin LUN:  %(is_thin)s""" % {
+            'name': name,
+            'has_snap': 'FakeSnap' if has_snap else 'N/A',
+            'size': size,
+            'state': state,
+            'faulted': faulted,
+            'operation': operation,
+            'is_thin': 'Yes' if is_thin else 'No'}, 0)
+
+    def STORAGE_GROUP_ISCSI_FC_HBA(self, sgname):
+
+        return ("""\
+        Storage Group Name:    %s
+        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:222                     SP A         4
+          22:34:56:78:90:12:34:56:12:34:56:78:90:12:34:56   SP B         2
+          22:34:56:78:90:54:32:16:12:34:56:78:90:54:32:16   SP B         2
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            1               1
+        Shareable:             YES""" % sgname, 0)
 
     def STORAGE_GROUP_NO_MAP(self, sgname):
         return ("""\
@@ -765,6 +923,45 @@ Available Capacity (GBs):  3257.851
           HBA UID                                          SP Name     SPPort
           -------                                          -------     ------
           iqn.1993-08.org.debian:01:222                     SP A         4
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            1               1
+        Shareable:             YES""" % sgname, 0)
+
+    def STORAGE_GROUP_HAS_MAP_ISCSI(self, sgname):
+
+        return ("""\
+        Storage Group Name:    %s
+        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:222                     SP A         2
+          iqn.1993-08.org.debian:01:222                     SP A         0
+          iqn.1993-08.org.debian:01:222                     SP B         2
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            1               1
+        Shareable:             YES""" % sgname, 0)
+
+    def STORAGE_GROUP_HAS_MAP_MP(self, sgname):
+
+        return ("""\
+        Storage Group Name:    %s
+        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:222                     SP A         4
+          iqn.1993-08.org.debian:01:222                     SP A         5
 
         HLU/ALU Pairs:
 
@@ -791,38 +988,6 @@ Available Capacity (GBs):  3257.851
             1               1
             2               3
         Shareable:             YES""" % sgname, 0)
-
-    def STORAGE_GROUP_HAS_MAP_3(self, sgname):
-
-        return ("""
-        Storage Group Name:    %s
-        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
-        HBA/SP Pairs:
-
-          HBA UID                                          SP Name     SPPort
-          -------                                          -------     ------
-          iqn.1993-08.org.debian:01:222                     SP A         4
-
-        HLU/ALU Pairs:
-
-          HLU Number     ALU Number
-          ----------     ----------
-            3               3
-            4               4
-        Shareable:             YES""" % sgname, 0)
-
-    def STORAGE_GROUP_REGISTED_NO_MAP(self, sgname):
-
-        return ("""
-        Storage Group Name:    %s
-        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
-        HBA/SP Pairs:
-
-          HBA UID                                          SP Name     SPPort
-          -------                                          -------     ------
-          22:34:56:78:90:12:34:56:12:34:56:78:90:12:34:56   SP A         0
-          iqn.1993-08.org.debian:01:222                     SP A         4
-        """ % sgname, 0)
 
     def POOL_FEATURE_INFO_POOL_LUNS_CMD(self):
         cmd = ('storagepool', '-feature', '-info',
@@ -893,9 +1058,9 @@ class DriverTestCaseBase(test.TestCase):
     def setUp(self):
         super(DriverTestCaseBase, self).setUp()
 
-        self.stubs.Set(CommandLineHelper, 'command_execute',
+        self.stubs.Set(emc_vnx_cli.CommandLineHelper, 'command_execute',
                        self.fake_command_execute_for_driver_setup)
-        self.stubs.Set(CommandLineHelper, 'get_array_serial',
+        self.stubs.Set(emc_vnx_cli.CommandLineHelper, 'get_array_serial',
                        mock.Mock(return_value={'array_serial':
                                                'fakeSerial'}))
         self.stubs.Set(os.path, 'exists', mock.Mock(return_value=1))
@@ -911,7 +1076,7 @@ class DriverTestCaseBase(test.TestCase):
         self.configuration.storage_vnx_pool_name = 'unit_test_pool'
         self.configuration.san_login = 'sysadmin'
         self.configuration.san_password = 'sysadmin'
-        #set the timeout to 0.012s = 0.0002 * 60 = 1.2ms
+        # set the timeout to 0.012s = 0.0002 * 60 = 1.2ms
         self.configuration.default_timeout = 0.0002
         self.configuration.initiator_auto_registration = True
         self.configuration.check_max_pool_luns_threshold = False
@@ -978,8 +1143,11 @@ class DriverTestCaseBase(test.TestCase):
         return standard_default
 
     def fake_command_execute_for_driver_setup(self, *command, **kwargv):
-        if command == ('connection', '-getport', '-address', '-vlanid'):
+        if (command == ('connection', '-getport', '-address', '-vlanid') or
+                command == ('connection', '-getport', '-vlanid')):
             return self.testData.ALL_PORTS
+        if command == self.testData.GETFCPORT_CMD():
+            return self.testData.FC_PORTS
         else:
             return SUCCEED
 
@@ -991,7 +1159,7 @@ class DriverTestCaseBase(test.TestCase):
 
 class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
     def generateDriver(self, conf):
-        return EMCCLIISCSIDriver(configuration=conf)
+        return emc_cli_iscsi.EMCCLIISCSIDriver(configuration=conf)
 
     @mock.patch(
         "eventlet.event.Event.wait",
@@ -1030,9 +1198,9 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        #case
+        # case
         self.driver.create_volume(self.testData.test_volume_with_type)
-        #verification
+        # verification
         expect_cmd = [
             mock.call(*self.testData.LUN_CREATION_CMD(
                 'vol_with_type', 1,
@@ -1066,10 +1234,10 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        #case
+        # case
         self.driver.create_volume(self.testData.test_volume_with_type)
 
-        #verification
+        # verification
         expect_cmd = [
             mock.call(*self.testData.LUN_CREATION_CMD(
                 'vol_with_type', 1,
@@ -1102,10 +1270,10 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        #case
+        # case
         self.driver.create_volume(self.testData.test_volume_with_type)
 
-        #verification
+        # verification
         expect_cmd = [
             mock.call(*self.testData.LUN_CREATION_CMD(
                 'vol_with_type', 1,
@@ -1132,10 +1300,10 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        #case
+        # case
         self.driver.create_volume(self.testData.test_volume_with_type)
 
-        #verification
+        # verification
         expect_cmd = [
             mock.call(*self.testData.LUN_CREATION_CMD(
                 'vol_with_type', 1,
@@ -1192,13 +1360,13 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
                         "driver_version is incorrect")
         self.assertTrue(
             stats['storage_protocol'] == 'iSCSI',
-            "storage_protocol is not correct")
+            "storage_protocol is incorrect")
         self.assertTrue(
             stats['vendor_name'] == "EMC",
-            "vendor name is not correct")
+            "vendor name is incorrect")
         self.assertTrue(
             stats['volume_backend_name'] == "namedbackend",
-            "volume backend name is not correct")
+            "volume backend name is incorrect")
 
         pool_stats = stats['pools'][0]
 
@@ -1231,7 +1399,7 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
         pool_stats = stats['pools'][0]
         self.assertTrue(
             pool_stats['free_capacity_gb'] == 0,
-            "free_capacity_gb is not correct")
+            "free_capacity_gb is incorrect")
         expect_cmd = [
             mock.call(*self.testData.POOL_FEATURE_INFO_POOL_LUNS_CMD(),
                       poll=False)]
@@ -1244,7 +1412,7 @@ class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
                         "driver_version is not returned")
         self.assertTrue(
             pool_stats['free_capacity_gb'] == 3257.851,
-            "free_capacity_gb is not correct")
+            "free_capacity_gb is incorrect")
 
     @mock.patch("cinder.volume.drivers.emc.emc_vnx_cli."
                 "CommandLineHelper.create_lun_by_cmd",
@@ -1288,7 +1456,7 @@ Time Remaining:  0 second(s)
         ret = self.driver.migrate_volume(None, self.testData.test_volume,
                                          fakehost)[0]
         self.assertTrue(ret)
-        #verification
+        # verification
         expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(1, 1),
                                 retry_disable=True,
                                 poll=True),
@@ -1337,7 +1505,7 @@ Time Remaining:  0 second(s)
         ret = self.driver.migrate_volume(None, self.testData.test_volume,
                                          fake_host)[0]
         self.assertTrue(ret)
-        #verification
+        # verification
         expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(),
                                 retry_disable=True,
                                 poll=True),
@@ -1384,7 +1552,7 @@ Time Remaining:  0 second(s)
         ret = self.driver.migrate_volume(None, self.testData.test_volume5,
                                          fakehost)[0]
         self.assertTrue(ret)
-        #verification
+        # verification
         expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(5, 5),
                                 retry_disable=True,
                                 poll=True),
@@ -1416,7 +1584,7 @@ Time Remaining:  0 second(s)
         ret = self.driver.migrate_volume(None, self.testData.test_volume,
                                          fakehost)[0]
         self.assertFalse(ret)
-        #verification
+        # verification
         expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(),
                                 retry_disable=True,
                                 poll=True)]
@@ -1451,12 +1619,11 @@ Time Remaining:  0 second(s)
                                       'storage_protocol': 'iSCSI'}}
 
         self.assertRaisesRegexp(exception.VolumeBackendAPIException,
-                                "Migration of LUN 1 has been Stopped or"
-                                " Faulted.",
+                                "Migration of LUN 1 has been stopped or"
+                                " faulted.",
                                 self.driver.migrate_volume,
                                 None, self.testData.test_volume, fake_host)
 
-        #verification
         expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(),
                                 retry_disable=True,
                                 poll=True),
@@ -1472,11 +1639,11 @@ Time Remaining:  0 second(s)
     def test_create_destroy_volume_snapshot(self):
         fake_cli = self.driverSetup()
 
-        #case
+        # case
         self.driver.create_snapshot(self.testData.test_snapshot)
         self.driver.delete_snapshot(self.testData.test_snapshot)
 
-        #verification
+        # verification
         expect_cmd = [mock.call(*self.testData.SNAP_CREATE_CMD('snapshot1'),
                                 poll=False),
                       mock.call(*self.testData.SNAP_DELETE_CMD('snapshot1'),
@@ -1485,7 +1652,7 @@ Time Remaining:  0 second(s)
         fake_cli.assert_has_calls(expect_cmd)
 
     @mock.patch(
-        "cinder.openstack.common.processutils.execute",
+        "oslo_concurrency.processutils.execute",
         mock.Mock(
             return_value=(
                 "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
@@ -1506,7 +1673,7 @@ Time Remaining:  0 second(s)
             self.testData.test_volume,
             self.testData.connector)
 
-        self.assertEqual(self.testData.iscsi_connection_info_ro,
+        self.assertEqual(self.testData.iscsi_connection_info,
                          connection_info)
 
         expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
@@ -1515,6 +1682,14 @@ Time Remaining:  0 second(s)
                     mock.call('storagegroup', '-gname', 'fakehost', '-setpath',
                               '-hbauid', 'iqn.1993-08.org.debian:01:222',
                               '-sp', 'A', '-spport', 4, '-spvport', 0,
+                              '-ip', '10.0.0.2', '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost', '-setpath',
+                              '-hbauid', 'iqn.1993-08.org.debian:01:222',
+                              '-sp', 'A', '-spport', 0, '-spvport', 0,
+                              '-ip', '10.0.0.2', '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost', '-setpath',
+                              '-hbauid', 'iqn.1993-08.org.debian:01:222',
+                              '-sp', 'B', '-spport', 2, '-spvport', 0,
                               '-ip', '10.0.0.2', '-host', 'fakehost', '-o'),
                     mock.call('storagegroup', '-list', '-gname', 'fakehost',
                               poll=True),
@@ -1527,7 +1702,7 @@ Time Remaining:  0 second(s)
                                                           '10.0.0.2'))]
         fake_cli.assert_has_calls(expected)
 
-        # Test for manaul registration
+        # Test for manual registration
         self.configuration.initiator_auto_registration = False
 
         commands = [('storagegroup', '-list', '-gname', 'fakehost'),
@@ -1545,7 +1720,7 @@ Time Remaining:  0 second(s)
             test_volume_rw,
             self.testData.connector)
 
-        self.assertEqual(self.testData.iscsi_connection_info_rw,
+        self.assertEqual(self.testData.iscsi_connection_info,
                          connection_info)
 
         expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
@@ -1563,8 +1738,80 @@ Time Remaining:  0 second(s)
                                                           '10.0.0.2'))]
         fake_cli.assert_has_calls(expected)
 
+        # Test No Ping
+        self.configuration.iscsi_initiators = None
+
+        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
+                    self.testData.CONNECTHOST_CMD('fakehost', 'fakehost')]
+        results = [
+            [("No group", 83),
+             self.testData.STORAGE_GROUP_HAS_MAP('fakehost')],
+            ('', 0)]
+        fake_cli = self.driverSetup(commands, results)
+        test_volume_rw = self.testData.test_volume_rw.copy()
+        test_volume_rw['provider_location'] = 'system^fakesn|type^lun|id^1'
+        connection_info = self.driver.initialize_connection(
+            test_volume_rw,
+            self.testData.connector)
+
+        self.assertEqual(self.testData.iscsi_connection_info,
+                         connection_info)
+
+        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('storagegroup', '-create', '-gname', 'fakehost'),
+                    mock.call('storagegroup', '-connecthost',
+                              '-host', 'fakehost', '-gname', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=True),
+                    mock.call('storagegroup', '-addhlu', '-hlu', 2, '-alu', 1,
+                              '-gname', 'fakehost', poll=False),
+                    mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
+                              poll=False)]
+        fake_cli.assert_has_calls(expected)
+
+    @mock.patch('random.randint',
+                mock.Mock(return_value=0))
+    def test_initialize_connection_multipath(self):
+        self.configuration.initiator_auto_registration = False
+
+        commands = [('storagegroup', '-list', '-gname', 'fakehost')]
+        results = [self.testData.STORAGE_GROUP_HAS_MAP_MP('fakehost')]
+        fake_cli = self.driverSetup(commands, results)
+        self.driver.cli.iscsi_targets = {
+            'A': [
+                {'Port WWN': 'iqn.1992-04.com.emc:cx.fnm00124000215.a4',
+                 'SP': 'A',
+                 'Port ID': 4,
+                 'Virtual Port ID': 0,
+                 'IP Address': '10.244.214.118'},
+                {'Port WWN': 'iqn.1992-04.com.emc:cx.fnm00124000215.a5',
+                 'SP': 'A',
+                 'Port ID': 5,
+                 'Virtual Port ID': 1,
+                 'IP Address': '10.244.214.119'}],
+            'B': []}
+        test_volume_rw = self.testData.test_volume_rw.copy()
+        test_volume_rw['provider_location'] = 'system^fakesn|type^lun|id^1'
+        connector_m = dict(self.testData.connector)
+        connector_m['multipath'] = True
+        connection_info = self.driver.initialize_connection(
+            test_volume_rw,
+            connector_m)
+
+        self.assertEqual(self.testData.iscsi_connection_info_mp,
+                         connection_info)
+
+        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('storagegroup', '-addhlu', '-hlu', 2, '-alu', 1,
+                              '-gname', 'fakehost', poll=False),
+                    mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
+                              poll=False)]
+        fake_cli.assert_has_calls(expected)
+
     @mock.patch(
-        "cinder.openstack.common.processutils.execute",
+        "oslo_concurrency.processutils.execute",
         mock.Mock(
             return_value=(
                 "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
@@ -1611,8 +1858,76 @@ Time Remaining:  0 second(s)
                                                           '10.0.0.2'))]
         fake_cli.assert_has_calls(expected)
 
+    @mock.patch('random.randint',
+                mock.Mock(return_value=0))
+    def test_initialize_connection_iscsi_white_list(self):
+        self.configuration.io_port_list = 'a-0-0,B-2-0'
+        test_volume = self.testData.test_volume.copy()
+        test_volume['provider_location'] = 'system^fakesn|type^lun|id^1'
+        # Test for auto registration
+        self.configuration.initiator_auto_registration = True
+        commands = [('storagegroup', '-list', '-gname', 'fakehost')]
+        results = [[("No group", 83),
+                    self.testData.STORAGE_GROUP_HAS_MAP_ISCSI('fakehost')]]
+        fake_cli = self.driverSetup(commands, results)
+        self.driver.cli.iscsi_targets = {'A': [{'SP': 'A', 'Port ID': 0,
+                                                'Virtual Port ID': 0,
+                                                'Port WWN': 'fake_iqn',
+                                                'IP Address': '192.168.1.1'}],
+                                         'B': [{'SP': 'B', 'Port ID': 2,
+                                                'Virtual Port ID': 0,
+                                                'Port WWN': 'fake_iqn1',
+                                                'IP Address': '192.168.1.2'}]}
+        self.driver.initialize_connection(
+            test_volume,
+            self.testData.connector)
+        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('storagegroup', '-create', '-gname', 'fakehost'),
+                    mock.call('storagegroup', '-gname', 'fakehost', '-setpath',
+                              '-hbauid', 'iqn.1993-08.org.debian:01:222',
+                              '-sp', 'A', '-spport', 0, '-spvport', 0,
+                              '-ip', '10.0.0.2', '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost', '-setpath',
+                              '-hbauid', 'iqn.1993-08.org.debian:01:222',
+                              '-sp', 'B', '-spport', 2, '-spvport', 0,
+                              '-ip', '10.0.0.2', '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=True),
+                    mock.call('storagegroup', '-addhlu', '-hlu', 2, '-alu', 1,
+                              '-gname', 'fakehost',
+                              poll=False),
+                    mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
+                              poll=False)]
+        fake_cli.assert_has_calls(expected)
+
+    @mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
+                'EMCVnxCliBase._build_pool_stats',
+                mock.Mock(return_value=None))
+    @mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
+                'CommandLineHelper.get_pool',
+                mock.Mock(return_value={'total_capacity_gb': 0.0,
+                                        'free_capacity_gb': 0.0}))
+    def test_update_iscsi_io_ports(self):
+        self.configuration.io_port_list = 'a-0-0,B-2-0'
+        # Test for auto registration
+        self.configuration.initiator_auto_registration = True
+        commands = [self.testData.GETPORT_CMD()]
+        results = [self.testData.WHITE_LIST_PORTS]
+        fake_cli = self.driverSetup(commands, results)
+        self.driver.cli.update_volume_stats()
+        expected = [mock.call(*self.testData.GETPORT_CMD(), poll=False)]
+        fake_cli.assert_has_calls(expected)
+        io_ports = self.driver.cli.iscsi_targets
+        self.assertEqual((io_ports['A'][0]['Port ID'],
+                          io_ports['A'][0]['Port WWN']),
+                         (0, 'iqn.1992-04.com.emc:cx.fnmxxx.a0'))
+        self.assertEqual((io_ports['B'][0]['Port ID'],
+                          io_ports['B'][0]['Port WWN']),
+                         (2, 'iqn.1992-04.com.emc:cx.fnmxxx.b2'))
+
     @mock.patch(
-        "cinder.openstack.common.processutils.execute",
+        "oslo_concurrency.processutils.execute",
         mock.Mock(
             return_value=(
                 "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
@@ -1659,7 +1974,7 @@ Time Remaining:  0 second(s)
         fake_cli.assert_has_calls(expected)
 
     @mock.patch(
-        "cinder.openstack.common.processutils.execute",
+        "oslo_concurrency.processutils.execute",
         mock.Mock(
             return_value=(
                 "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
@@ -1698,7 +2013,8 @@ Time Remaining:  0 second(s)
     def test_terminate_connection(self):
 
         os.path.exists = mock.Mock(return_value=1)
-        self.driver = EMCCLIISCSIDriver(configuration=self.configuration)
+        self.driver = emc_cli_iscsi.EMCCLIISCSIDriver(
+            configuration=self.configuration)
         cli_helper = self.driver.cli._client
         data = {'storage_group_name': "fakehost",
                 'storage_group_uid': "2F:D4:00:00:00:00:00:"
@@ -1737,17 +2053,67 @@ Time Remaining:  0 second(s)
             'failed_vol1', 1, 'unit_test_pool', None, None, False))]
         fake_cli.assert_has_calls(expect_cmd)
 
+    @mock.patch('cinder.openstack.common.loopingcall.FixedIntervalLoopingCall',
+                new=utils.ZeroIntervalLoopingCall)
+    def test_create_faulted_volume(self):
+        volume_name = 'faulted_volume'
+        cmd_create = self.testData.LUN_CREATION_CMD(
+            volume_name, 1, 'unit_test_pool', None, None, False)
+        cmd_list_preparing = self.testData.LUN_PROPERTY_ALL_CMD(volume_name)
+        commands = [cmd_create, cmd_list_preparing]
+        results = [SUCCEED,
+                   [self.testData.LUN_PROPERTY(name=volume_name,
+                                               state='Faulted',
+                                               faulted='true',
+                                               operation='Preparing'),
+                    self.testData.LUN_PROPERTY(name=volume_name,
+                                               state='Faulted',
+                                               faulted='true',
+                                               operation='None')]]
+        fake_cli = self.driverSetup(commands, results)
+        faulted_volume = self.testData.test_volume.copy()
+        faulted_volume.update({'name': volume_name})
+        self.driver.create_volume(faulted_volume)
+        expect_cmd = [
+            mock.call(*self.testData.LUN_CREATION_CMD(
+                volume_name, 1, 'unit_test_pool', None, None, False)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(volume_name),
+                      poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(volume_name),
+                      poll=False)]
+        fake_cli.assert_has_calls(expect_cmd)
+
+    @mock.patch('cinder.openstack.common.loopingcall.FixedIntervalLoopingCall',
+                new=utils.ZeroIntervalLoopingCall)
+    def test_create_offline_volume(self):
+        volume_name = 'offline_volume'
+        cmd_create = self.testData.LUN_CREATION_CMD(
+            volume_name, 1, 'unit_test_pool', None, None, False)
+        cmd_list = self.testData.LUN_PROPERTY_ALL_CMD(volume_name)
+        commands = [cmd_create, cmd_list]
+        results = [SUCCEED,
+                   self.testData.LUN_PROPERTY(name=volume_name,
+                                              state='Offline',
+                                              faulted='true')]
+        self.driverSetup(commands, results)
+        offline_volume = self.testData.test_volume.copy()
+        offline_volume.update({'name': volume_name})
+        self.assertRaisesRegexp(exception.VolumeBackendAPIException,
+                                "Volume %s was created in VNX, but in"
+                                " Offline state." % volume_name,
+                                self.driver.create_volume,
+                                offline_volume)
+
     def test_create_volume_snapshot_failed(self):
         commands = [self.testData.SNAP_CREATE_CMD('failed_snapshot')]
         results = [FAKE_ERROR_RETURN]
         fake_cli = self.driverSetup(commands, results)
 
-        #case
+        # case
         self.assertRaises(exception.EMCVnxCLICmdError,
                           self.driver.create_snapshot,
                           self.testData.test_failed_snapshot)
-
-        #verification
+        # verification
         expect_cmd = [
             mock.call(
                 *self.testData.SNAP_CREATE_CMD('failed_snapshot'),
@@ -1756,7 +2122,7 @@ Time Remaining:  0 second(s)
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_volume_from_snapshot(self):
-        #set up
+        # set up
         cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
         cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
         output_dest = self.testData.LUN_PROPERTY("vol2_dest")
@@ -1796,6 +2162,8 @@ Time Remaining:  0 second(s)
                       poll=True)]
         fake_cli.assert_has_calls(expect_cmd)
 
+    @mock.patch('cinder.openstack.common.loopingcall.FixedIntervalLoopingCall',
+                new=utils.ZeroIntervalLoopingCall)
     def test_create_volume_from_snapshot_sync_failed(self):
 
         cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
@@ -2026,6 +2394,8 @@ Time Remaining:  0 second(s)
                               poll=False)]
         fake_cli.assert_has_calls(expected)
 
+    @mock.patch('cinder.openstack.common.loopingcall.FixedIntervalLoopingCall',
+                new=utils.ZeroIntervalLoopingCall)
     def test_extend_volume_failed(self):
         commands = [self.testData.LUN_PROPERTY_ALL_CMD('failed_vol1')]
         results = [self.testData.LUN_PROPERTY('failed_vol1', size=2)]
@@ -2052,9 +2422,10 @@ Time Remaining:  0 second(s)
         results = [SUCCEED]
         self.configuration.storage_vnx_pool_name = \
             self.testData.test_pool_name
-        self.driver = EMCCLIISCSIDriver(configuration=self.configuration)
+        self.driver = emc_cli_iscsi.EMCCLIISCSIDriver(
+            configuration=self.configuration)
         assert isinstance(self.driver.cli, emc_vnx_cli.EMCVnxCliPool)
-        #mock the command executor
+        # mock the command executor
         fake_command_execute = self.get_command_execute_simulator(
             commands, results)
         fake_cli = mock.MagicMock(side_effect=fake_command_execute)
@@ -2074,9 +2445,10 @@ Time Remaining:  0 second(s)
         results = [self.testData.LUN_PROPERTY('lun_name')]
         invalid_pool_name = "fake_pool"
         self.configuration.storage_vnx_pool_name = invalid_pool_name
-        self.driver = EMCCLIISCSIDriver(configuration=self.configuration)
+        self.driver = emc_cli_iscsi.EMCCLIISCSIDriver(
+            configuration=self.configuration)
         assert isinstance(self.driver.cli, emc_vnx_cli.EMCVnxCliPool)
-        #mock the command executor
+        # mock the command executor
         fake_command_execute = self.get_command_execute_simulator(
             commands, results)
         fake_cli = mock.MagicMock(side_effect=fake_command_execute)
@@ -2102,10 +2474,11 @@ Time Remaining:  0 second(s)
 
         self.configuration.storage_vnx_pool_name = \
             self.testData.test_pool_name
-        self.driver = EMCCLIISCSIDriver(configuration=self.configuration)
+        self.driver = emc_cli_iscsi.EMCCLIISCSIDriver(
+            configuration=self.configuration)
         assert isinstance(self.driver.cli, emc_vnx_cli.EMCVnxCliPool)
 
-        #mock the command executor
+        # mock the command executor
         fake_command_execute = self.get_command_execute_simulator(
             commands, results)
         fake_cli = mock.MagicMock(side_effect=fake_command_execute)
@@ -2117,7 +2490,7 @@ Time Remaining:  0 second(s)
         expected = [mock.call(*get_lun_cmd, poll=True)]
         assert get_size == test_size
         fake_cli.assert_has_calls(expected)
-        #Test the function with invalid reference.
+        # Test the function with invalid reference.
         invaild_ref = {'fake': 'fake_ref'}
         self.assertRaises(exception.ManageExistingInvalidReference,
                           self.driver.manage_existing_get_size,
@@ -2174,7 +2547,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         self.driver.retype(None, self.testData.test_volume3,
@@ -2243,7 +2616,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         self.driver.retype(None, self.testData.test_volume3,
@@ -2317,7 +2690,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         self.driver.retype(None, self.testData.test_volume3,
@@ -2380,7 +2753,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         self.driver.retype(None, self.testData.test_volume3,
@@ -2433,7 +2806,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         retyped = self.driver.retype(None, self.testData.test_volume3,
@@ -2495,7 +2868,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         self.driver.retype(None, self.testData.test_volume3,
@@ -2557,7 +2930,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         retyped = self.driver.retype(None, self.testData.test_volume3,
@@ -2608,7 +2981,7 @@ Time Remaining:  0 second(s)
                                     '-Deduplication',
                                     '-ThinProvisioning',
                                     '-FAST']
-        CommandLineHelper.get_array_serial = mock.Mock(
+        emc_vnx_cli.CommandLineHelper.get_array_serial = mock.Mock(
             return_value={'array_serial': "FNM00124500890"})
 
         self.driver.retype(None, self.testData.test_volume3,
@@ -2621,7 +2994,7 @@ Time Remaining:  0 second(s)
         "get_volume_type_extra_specs",
         mock.Mock(return_value={'fast_cache_enabled': 'True'}))
     def test_create_volume_with_fastcache(self):
-        '''enable fastcache when creating volume.'''
+        """Enable fastcache when creating volume."""
         commands = [self.testData.NDU_LIST_CMD,
                     self.testData.POOL_PROPERTY_W_FASTCACHE_CMD,
                     self.testData.LUN_PROPERTY_ALL_CMD('vol_with_type'),
@@ -2645,7 +3018,8 @@ Time Remaining:  0 second(s)
 
         self.configuration.storage_vnx_pool_name = \
             self.testData.test_pool_name
-        self.driver = EMCCLIISCSIDriver(configuration=self.configuration)
+        self.driver = emc_cli_iscsi.EMCCLIISCSIDriver(
+            configuration=self.configuration)
         assert isinstance(self.driver.cli, emc_vnx_cli.EMCVnxCliPool)
 
         cli_helper = self.driver.cli._client
@@ -2667,14 +3041,15 @@ Time Remaining:  0 second(s)
             mock.call('connection', '-getport', '-address', '-vlanid',
                       poll=False),
             mock.call('-np', 'lun', '-create', '-capacity',
-                      1, '-sq', 'gb', '-poolName', 'Pool_02_SASFLASH',
+                      1, '-sq', 'gb', '-poolName',
+                      self.testData.test_pool_name,
                       '-name', 'vol_with_type', '-type', 'NonThin')
         ]
 
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_get_lun_id_provider_location_exists(self):
-        '''test function get_lun_id.'''
+        """Test function get_lun_id."""
         self.driverSetup()
         volume_01 = {
             'name': 'vol_01',
@@ -2695,7 +3070,7 @@ Time Remaining:  0 second(s)
         "get_lun_by_name",
         mock.Mock(return_value={'lun_id': 2}))
     def test_get_lun_id_provider_location_has_no_lun_id(self):
-        '''test function get_lun_id.'''
+        """Test function get_lun_id."""
         self.driverSetup()
         volume_02 = {
             'name': 'vol_02',
@@ -2724,6 +3099,21 @@ Time Remaining:  0 second(s)
                 *self.testData.CREATE_CONSISTENCYGROUP_CMD(
                     cg_name))]
         fake_cli.assert_has_calls(expect_cmd)
+
+    @mock.patch(
+        "cinder.volume.volume_types.get_volume_type_extra_specs",
+        mock.Mock(side_effect=[{'storagetype:provisioning': 'thin'},
+                               {'storagetype:provisioning': 'compressed'}]))
+    def test_create_consistency_group_failed_with_compression(self):
+        self.driverSetup([], [])
+        self.assertRaisesRegexp(exception.VolumeBackendAPIException,
+                                "Failed to create consistency group "
+                                "consistencygroup_id "
+                                "because VNX consistency group cannot "
+                                "accept compressed LUNs as members.",
+                                self.driver.create_consistencygroup,
+                                None,
+                                self.testData.test_cg_with_type)
 
     def test_delete_consistency_group(self):
         cg_name = self.testData.test_cg['id']
@@ -2799,7 +3189,7 @@ Time Remaining:  0 second(s)
             mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
                       poll=False),
             mock.call(*self.testData.ADD_LUN_TO_CG_CMD(
-                'cg_id', 1))]
+                'cg_id', 1), poll=False)]
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_cloned_volume_from_consistnecy_group(self):
@@ -2886,6 +3276,75 @@ Time Remaining:  0 second(s)
                       poll=True)]
         fake_cli.assert_has_calls(expect_cmd)
 
+    def test_update_consistencygroup(self):
+        cg_name = self.testData.test_cg['id']
+        commands = [self.testData.GET_CG_BY_NAME_CMD(cg_name)]
+        results = [self.testData.CG_PROPERTY(cg_name)]
+        fake_cli = self.driverSetup(commands, results)
+
+        (model_update, add_vols, remove_vols) = (
+            self.driver.update_consistencygroup(None, self.testData.test_cg,
+                                                self.testData.
+                                                VOLUMES_NOT_IN_CG(),
+                                                self.testData.VOLUMES_IN_CG()))
+        expect_cmd = [
+            mock.call(*self.testData.REPLACE_LUNS_IN_CG_CMD(
+                cg_name, ['4', '5']), poll=False)]
+        fake_cli.assert_has_calls(expect_cmd)
+        self.assertEqual('available', model_update['status'])
+
+    def test_update_consistencygroup_remove_all(self):
+        cg_name = self.testData.test_cg['id']
+        commands = [self.testData.GET_CG_BY_NAME_CMD(cg_name)]
+        results = [self.testData.CG_PROPERTY(cg_name)]
+        fake_cli = self.driverSetup(commands, results)
+
+        (model_update, add_vols, remove_vols) = (
+            self.driver.update_consistencygroup(None, self.testData.test_cg,
+                                                None,
+                                                self.testData.VOLUMES_IN_CG()))
+        expect_cmd = [
+            mock.call(*self.testData.REMOVE_LUNS_FROM_CG_CMD(
+                cg_name, ['1', '3']), poll=False)]
+        fake_cli.assert_has_calls(expect_cmd)
+        self.assertEqual('available', model_update['status'])
+
+    def test_update_consistencygroup_remove_not_in_cg(self):
+        cg_name = self.testData.test_cg['id']
+        commands = [self.testData.GET_CG_BY_NAME_CMD(cg_name)]
+        results = [self.testData.CG_PROPERTY(cg_name)]
+        fake_cli = self.driverSetup(commands, results)
+
+        (model_update, add_vols, remove_vols) = (
+            self.driver.update_consistencygroup(None, self.testData.test_cg,
+                                                None,
+                                                self.testData.
+                                                VOLUMES_NOT_IN_CG()))
+        expect_cmd = [
+            mock.call(*self.testData.REPLACE_LUNS_IN_CG_CMD(
+                cg_name, ['1', '3']), poll=False)]
+        fake_cli.assert_has_calls(expect_cmd)
+        self.assertEqual('available', model_update['status'])
+
+    def test_update_consistencygroup_error(self):
+        cg_name = self.testData.test_cg['id']
+        commands = [self.testData.GET_CG_BY_NAME_CMD(cg_name),
+                    self.testData.REPLACE_LUNS_IN_CG_CMD(
+                    cg_name, ['1', '3'])]
+        results = [self.testData.CG_PROPERTY(cg_name),
+                   self.testData.CG_REPL_ERROR()]
+        fake_cli = self.driverSetup(commands, results)
+        self.assertRaises(exception.EMCVnxCLICmdError,
+                          self.driver.update_consistencygroup,
+                          None,
+                          self.testData.test_cg,
+                          [],
+                          self.testData.VOLUMES_NOT_IN_CG())
+        expect_cmd = [
+            mock.call(*self.testData.REPLACE_LUNS_IN_CG_CMD(
+                cg_name, ['1', '3']), poll=False)]
+        fake_cli.assert_has_calls(expect_cmd)
+
     def test_deregister_initiator(self):
         fake_cli = self.driverSetup()
         self.driver.cli.destroy_empty_sg = True
@@ -2916,6 +3375,13 @@ Time Remaining:  0 second(s)
                       '-o')]
         fake_cli.assert_has_calls(expect_cmd)
 
+    def test_unmanage(self):
+        self.driverSetup()
+        try:
+            self.driver.unmanage(self.testData.test_volume)
+        except NotImplementedError:
+            self.fail('Interface unmanage need to be implemented')
+
 
 class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
     def setUp(self):
@@ -2925,7 +3391,7 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
              'volume_backend_name': 'namedbackend'})
 
     def generateDriver(self, conf):
-        driver = EMCCLIISCSIDriver(configuration=conf)
+        driver = emc_cli_iscsi.EMCCLIISCSIDriver(configuration=conf)
         self.assertTrue(isinstance(driver.cli,
                                    emc_vnx_cli.EMCVnxCliArray))
         return driver
@@ -3056,7 +3522,7 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
         results = [self.testData.LUN_PROPERTY(testVolume['name'], False)]
         fake_cli = self.driverSetup(commands, results)
         pool = self.driver.get_pool(testVolume)
-        self.assertEqual('Pool_02_SASFLASH', pool)
+        self.assertEqual('unit_test_pool', pool)
         fake_cli.assert_has_calls(
             [mock.call(*self.testData.LUN_PROPERTY_POOL_CMD(
                 testVolume['name']), poll=False)])
@@ -3078,7 +3544,7 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
         fake_cli = self.driverSetup(commands, results)
         pool = self.driver.cli.get_target_storagepool(testNewVolume,
                                                       testSrcVolume)
-        self.assertEqual('Pool_02_SASFLASH', pool)
+        self.assertEqual('unit_test_pool', pool)
         fake_cli.assert_has_calls(
             [mock.call(*self.testData.LUN_PROPERTY_POOL_CMD(
                 testSrcVolume['name']), poll=False)])
@@ -3092,7 +3558,7 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
         results = [self.testData.LUN_PROPERTY('lun_name', size=test_size)]
         fake_cli = self.driverSetup(commands, results)
         test_volume = self.testData.test_volume2.copy()
-        test_volume['host'] = "host@backendsec#Pool_02_SASFLASH"
+        test_volume['host'] = "host@backendsec#unit_test_pool"
         get_size = self.driver.manage_existing_get_size(
             test_volume,
             self.testData.test_existing_ref)
@@ -3114,7 +3580,7 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
         ex = self.assertRaises(
             exception.ManageExistingInvalidReference,
             self.driver.manage_existing_get_size,
-            self.testData.test_volume_with_type,
+            test_volume,
             self.testData.test_existing_ref)
         self.assertTrue(
             re.match(r'.*not managed by the host',
@@ -3176,10 +3642,10 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
 
 class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
     def generateDriver(self, conf):
-        return EMCCLIFCDriver(configuration=conf)
+        return emc_cli_fc.EMCCLIFCDriver(configuration=conf)
 
     @mock.patch(
-        "cinder.openstack.common.processutils.execute",
+        "oslo_concurrency.processutils.execute",
         mock.Mock(
             return_value=(
                 "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
@@ -3215,9 +3681,21 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
                               '-host', 'fakehost', '-o'),
                     mock.call('storagegroup', '-gname', 'fakehost',
                               '-setpath', '-hbauid',
+                              '22:34:56:78:90:12:34:56:12:34:56:78:'
+                              '90:12:34:56',
+                              '-sp', 'B', '-spport', '2', '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
                               '22:34:56:78:90:54:32:16:12:34:56:78:'
                               '90:54:32:16',
                               '-sp', 'A', '-spport', '0', '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:54:32:16:12:34:56:78:'
+                              '90:54:32:16',
+                              '-sp', 'B', '-spport', '2', '-ip', '10.0.0.2',
                               '-host', 'fakehost', '-o'),
                     mock.call('storagegroup', '-list', '-gname', 'fakehost',
                               poll=True),
@@ -3277,8 +3755,8 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
                    ('', 0),
                    self.testData.FC_PORTS]
         fake_cli = self.driverSetup(commands, results)
-        self.driver.cli.zonemanager_lookup_service = FCSanLookupService(
-            configuration=self.configuration)
+        self.driver.cli.zonemanager_lookup_service =\
+            fc_service.FCSanLookupService(configuration=self.configuration)
 
         conn_info = self.driver.initialize_connection(
             self.testData.test_volume,
@@ -3300,15 +3778,116 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
                               poll=False),
                     mock.call('storagegroup', '-list', '-gname', 'fakehost',
                               poll=True),
-                    mock.call('port', '-list', '-sp', poll=True)]
+                    mock.call('port', '-list', '-sp')]
         fake_cli.assert_has_calls(expected)
+
+    @mock.patch('random.randint',
+                mock.Mock(return_value=0))
+    def test_initialize_connection_fc_white_list(self):
+        self.configuration.io_port_list = 'a-0,B-2'
+        test_volume = self.testData.test_volume.copy()
+        test_volume['provider_location'] = 'system^fakesn|type^lun|id^1'
+        self.configuration.initiator_auto_registration = True
+        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
+                    self.testData.GETFCPORT_CMD(),
+                    ('port', '-list', '-gname', 'fakehost')]
+        results = [[("No group", 83),
+                    self.testData.STORAGE_GROUP_HAS_MAP_ISCSI('fakehost')],
+                   self.testData.FC_PORTS,
+                   self.testData.FAKEHOST_PORTS]
+
+        fake_cli = self.driverSetup(commands, results)
+        data = self.driver.initialize_connection(
+            test_volume,
+            self.testData.connector)
+
+        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('storagegroup', '-create', '-gname', 'fakehost'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:12:34:56:'
+                              '12:34:56:78:90:12:34:56',
+                              '-sp', 'A', '-spport', 0, '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:12:34:56:'
+                              '12:34:56:78:90:12:34:56',
+                              '-sp', 'B', '-spport', 2, '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:54:32:16:'
+                              '12:34:56:78:90:54:32:16',
+                              '-sp', 'A', '-spport', 0, '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:54:32:16:'
+                              '12:34:56:78:90:54:32:16',
+                              '-sp', 'B', '-spport', 2, '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=True),
+                    mock.call('storagegroup', '-addhlu', '-hlu', 2, '-alu', 1,
+                              '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('port', '-list', '-gname', 'fakehost')]
+        fake_cli.assert_has_calls(expected)
+        self.assertEqual(data['data']['target_wwn'],
+                         ['5006016A0860080F', '5006016008600195'])
+
+    @mock.patch('random.randint',
+                mock.Mock(return_value=0))
+    def test_initialize_connection_fc_port_registered_wl(self):
+        self.configuration.io_port_list = 'a-0,B-2'
+        test_volume = self.testData.test_volume.copy()
+        test_volume['provider_location'] = 'system^fakesn|type^lun|id^1'
+        self.configuration.initiator_auto_registration = True
+        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
+                    self.testData.GETFCPORT_CMD(),
+                    ('port', '-list', '-gname', 'fakehost')]
+        results = [self.testData.STORAGE_GROUP_ISCSI_FC_HBA('fakehost'),
+                   self.testData.FC_PORTS,
+                   self.testData.FAKEHOST_PORTS]
+
+        fake_cli = self.driverSetup(commands, results)
+        data = self.driver.initialize_connection(
+            test_volume,
+            self.testData.connector)
+
+        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:12:34:56:'
+                              '12:34:56:78:90:12:34:56',
+                              '-sp', 'A', '-spport', 0, '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-gname', 'fakehost',
+                              '-setpath', '-hbauid',
+                              '22:34:56:78:90:54:32:16:'
+                              '12:34:56:78:90:54:32:16',
+                              '-sp', 'A', '-spport', 0, '-ip', '10.0.0.2',
+                              '-host', 'fakehost', '-o'),
+                    mock.call('storagegroup', '-list', '-gname', 'fakehost',
+                              poll=True),
+                    mock.call('storagegroup', '-addhlu', '-hlu', 2, '-alu', 1,
+                              '-gname', 'fakehost',
+                              poll=False),
+                    mock.call('port', '-list', '-gname', 'fakehost')]
+        fake_cli.assert_has_calls(expected)
+        self.assertEqual(data['data']['target_wwn'],
+                         ['5006016A0860080F', '5006016008600195'])
 
     @mock.patch(
         "cinder.zonemanager.fc_san_lookup_service.FCSanLookupService." +
         "get_device_mapping_from_network",
         mock.Mock(return_value=EMCVNXCLIDriverTestData.device_map))
     def test_terminate_connection_remove_zone_false(self):
-        self.driver = EMCCLIFCDriver(configuration=self.configuration)
+        self.driver = emc_cli_fc.EMCCLIFCDriver(
+            configuration=self.configuration)
         cli_helper = self.driver.cli._client
         data = {'storage_group_name': "fakehost",
                 'storage_group_uid': "2F:D4:00:00:00:00:00:"
@@ -3317,8 +3896,8 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
         cli_helper.get_storage_group = mock.Mock(
             return_value=data)
         cli_helper.remove_hlu_from_storagegroup = mock.Mock()
-        self.driver.cli.zonemanager_lookup_service = FCSanLookupService(
-            configuration=self.configuration)
+        self.driver.cli.zonemanager_lookup_service =\
+            fc_service.FCSanLookupService(configuration=self.configuration)
         connection_info = self.driver.terminate_connection(
             self.testData.test_volume,
             self.testData.connector)
@@ -3333,7 +3912,8 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
         "get_device_mapping_from_network",
         mock.Mock(return_value=EMCVNXCLIDriverTestData.device_map))
     def test_terminate_connection_remove_zone_true(self):
-        self.driver = EMCCLIFCDriver(configuration=self.configuration)
+        self.driver = emc_cli_fc.EMCCLIFCDriver(
+            configuration=self.configuration)
         cli_helper = self.driver.cli._client
         data = {'storage_group_name': "fakehost",
                 'storage_group_uid': "2F:D4:00:00:00:00:00:"
@@ -3342,8 +3922,8 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
         cli_helper.get_storage_group = mock.Mock(
             return_value=data)
         cli_helper.remove_hlu_from_storagegroup = mock.Mock()
-        self.driver.cli.zonemanager_lookup_service = FCSanLookupService(
-            configuration=self.configuration)
+        self.driver.cli.zonemanager_lookup_service =\
+            fc_service.FCSanLookupService(configuration=self.configuration)
         connection_info = self.driver.terminate_connection(
             self.testData.test_volume,
             self.testData.connector)
@@ -3364,13 +3944,13 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
                         "driver_version is incorrect")
         self.assertTrue(
             stats['storage_protocol'] == 'FC',
-            "storage_protocol is not correct")
+            "storage_protocol is incorrect")
         self.assertTrue(
             stats['vendor_name'] == "EMC",
-            "vendor name is not correct")
+            "vendor name is incorrect")
         self.assertTrue(
             stats['volume_backend_name'] == "namedbackend",
-            "volume backend name is not correct")
+            "volume backend name is incorrect")
 
         pool_stats = stats['pools'][0]
 
@@ -3403,7 +3983,7 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
         pool_stats = stats['pools'][0]
         self.assertTrue(
             pool_stats['free_capacity_gb'] == 0,
-            "free_capacity_gb is not correct")
+            "free_capacity_gb is incorrect")
         expect_cmd = [
             mock.call(*self.testData.POOL_FEATURE_INFO_POOL_LUNS_CMD(),
                       poll=False)]
@@ -3413,10 +3993,10 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
         stats = self.driver.get_volume_stats(True)
         pool_stats = stats['pools'][0]
         self.assertTrue(stats['driver_version'] is not None,
-                        "driver_version is not returned")
+                        "driver_version is incorrect")
         self.assertTrue(
             pool_stats['free_capacity_gb'] == 3257.851,
-            "free_capacity_gb is not correct")
+            "free_capacity_gb is incorrect")
 
     def test_deregister_initiator(self):
         fake_cli = self.driverSetup()
@@ -3450,7 +4030,7 @@ class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
         fake_cli.assert_has_calls(expect_cmd)
 
 
-class EMCVNXCLIToggleSPTestData():
+class EMCVNXCLIToggleSPTestData(object):
     def FAKE_COMMAND_PREFIX(self, sp_address):
         return ('/opt/Navisphere/bin/naviseccli', '-address', sp_address,
                 '-user', 'sysadmin', '-password', 'sysadmin',
@@ -3599,927 +4179,3 @@ Message : Error occurred because of time out"""
                         + FAKE_COMMAND),
                     check_exit_code=True)]
             mock_utils.assert_has_calls(expected)
-
-
-class BatchAttachDetachTestCaseBase(DriverTestCaseBase):
-    def generateAddOrder(self, alu, **kwargs):
-        order = emc_vnx_cli.Order(alu, True)
-        for key in kwargs:
-            if hasattr(order, key):
-                setattr(order, key, kwargs[key])
-        return order
-
-    def generateRemoveOrder(self, alu, **kwargs):
-        order = emc_vnx_cli.Order(alu, False)
-        for key in kwargs:
-            if hasattr(order, key):
-                setattr(order, key, kwargs[key])
-        return order
-
-    @mock.patch("eventlet.greenthread.spawn", mock.Mock())
-    def get_batch_worker_executor(self, connector):
-        worker = emc_vnx_cli.BatchAttachDetachBatchWorker(
-            self.driver.cli, connector, 0)
-        return worker.execute
-
-
-@mock.patch("random.shuffle",
-            mock.Mock(return_value=0))
-class BatchAttachDetachISCSITestCase(BatchAttachDetachTestCaseBase):
-    def generateDriver(self, conf):
-        conf.attach_detach_batch_interval = 20
-        return EMCCLIISCSIDriver(configuration=conf)
-
-    @mock.patch(
-        "cinder.openstack.common.processutils.execute",
-        mock.Mock(
-            return_value=(
-                "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
-    def test_initialize_connection_withPingNode(self):
-        test_volume = self.testData.test_volume.copy()
-        test_volume['provider_location'] = 'system^fakesn|type^lun|id^1'
-        td = self.testData
-        commands = [self.testData.PINGNODE_CMD('A', 4, 0, '10.0.0.2')]
-        results = [self.testData.PING_OK]
-        fake_cli = self.driverSetup(commands, results)
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(
-                    emc_vnx_cli.AddHluStatus.OK,
-                    hlu=3,
-                    payload={
-                        'raw_output': td.STORAGE_GROUP_HAS_MAP('fakehost')[0]})
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            iscsi_data = self.driver.initialize_connection(
-                test_volume,
-                self.testData.connector)
-            self.assertTrue(iscsi_data['data']['target_lun'] == 3,
-                            "iSCSI initialize connection returned wrong HLU")
-            expected = [mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
-                                  poll=False),
-                        mock.call(*self.testData.PINGNODE_CMD('A', 4, 0,
-                                                              '10.0.0.2'))]
-            fake_cli.assert_has_calls(expected)
-
-    @mock.patch(
-        "cinder.openstack.common.processutils.execute",
-        mock.Mock(
-            return_value=(
-                "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
-    def test_initialize_connection_noPingNode(self):
-        test_volume = self.testData.test_volume.copy()
-        test_volume['provider_location'] = 'system^fakesn|type^lun|id^1'
-        td = self.testData
-        old_iscsi_initiators = self.configuration.iscsi_initiators
-        self.configuration.iscsi_initiators = ''
-        fake_cli = self.driverSetup([], [])
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(
-                    emc_vnx_cli.AddHluStatus.OK,
-                    hlu=3,
-                    payload={'raw_output':
-                             td.STORAGE_GROUP_HAS_MAP('fakehost')[0]})
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            iscsi_data = self.driver.initialize_connection(
-                test_volume,
-                self.testData.connector)
-            self.assertTrue(iscsi_data['data']['target_lun'] == 3,
-                            "iSCSI initialize connection returned wrong HLU")
-            expected = [mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
-                                  poll=False)]
-            fake_cli.assert_has_calls(expected)
-
-        self.configuration.iscsi_initiators = old_iscsi_initiators
-
-    @mock.patch(
-        "cinder.openstack.common.processutils.execute",
-        mock.Mock(
-            return_value=(
-                "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
-    @mock.patch(
-        "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase.get_lun_id",
-        mock.Mock(
-            return_value=4))
-    def test_initialize_connection_no_hlu_left(self):
-        """There is no usable hlu for the SG
-        """
-        self.driverSetup([], [])
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.status = emc_vnx_cli.AddHluStatus.NO_HLU_LEFT
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            self.assertRaises(exception.VolumeBackendAPIException,
-                              self.driver.initialize_connection,
-                              self.testData.test_volume,
-                              self.testData.connector)
-
-    @mock.patch(
-        "cinder.openstack.common.processutils.execute",
-        mock.Mock(
-            return_value=(
-                "fakeportal iqn.1992-04.fake.com:fake.apm00123907237.a8", 0)))
-    @mock.patch(
-        "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase.get_lun_id",
-        mock.Mock(
-            return_value=4))
-    def test_initialize_connection_failure(self):
-        """There is no usable hlu for the SG
-        """
-        self.driverSetup([], [])
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(emc_vnx_cli.AddHluStatus.FAILURE)
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            self.assertRaises(exception.VolumeBackendAPIException,
-                              self.driver.initialize_connection,
-                              self.testData.test_volume,
-                              self.testData.connector)
-
-    def test_terminate_connection_failure(self):
-        self.driverSetup([], [])
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(emc_vnx_cli.RemoveHluStatus.FAILURE)
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            self.assertRaises(exception.VolumeBackendAPIException,
-                              self.driver.terminate_connection,
-                              self.testData.test_volume,
-                              self.testData.connector)
-
-    def test_terminate_connection(self):
-        self.driverSetup([], [])
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG)
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            self.driver.terminate_connection(
-                self.testData.test_volume,
-                self.testData.connector)
-
-        class fake_batch_worker_not_in_SG(object):
-            def submit(self, order):
-                order.update_status(emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG)
-
-        with mock.patch('cinder.volume.drivers.emc.emc_vnx_cli.'
-                        'EMCVnxCliBase.get_batch_worker',
-                        mock.Mock(return_value=fake_batch_worker())):
-            self.driver.terminate_connection(
-                self.testData.test_volume,
-                self.testData.connector)
-
-    def test_handle_order_in_batch(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=2))
-        orderList.append(self.generateRemoveOrder(alu=3))
-        orderList.append(self.generateRemoveOrder(alu=4))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '255,254', '-alus', '1,2', '-verboseStatus',
-                     '-o'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '3,4', '-verboseStatus',
-                     '-o')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                   ("LUs Added: 1,2.", 0),
-                   ("LUs Removed: 3,4.", 0)]
-
-        fake_cli = self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-        self.assertTrue(orderList[0].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[0].hlu == 255,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[1].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[1].hlu == 254,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[3].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-addhlu', '-gname', 'fakehost',
-                              '-hlus', '255,254', '-alus',
-                              '1,2', '-verboseStatus', '-o',
-                              poll=False,
-                              retry_disable=True),
-                    mock.call('storagegroup', '-removehlu', '-gname',
-                              'fakehost', '-hlus', '3,4', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True)]
-
-        fake_cli.assert_has_calls(expected)
-
-    def test_handle_order_revert_1(self):
-        """Test handle the orders when there are revert after timeout.
-
-        Terminate connection to same alu right after
-        a initialize connection is running
-        """
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=2))
-        orderList.append(self.generateRemoveOrder(alu=1))
-        orderList.append(self.generateRemoveOrder(alu=1))
-        orderList.append(self.generateRemoveOrder(alu=4))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '255', '-alus', '2', '-verboseStatus',
-                     '-o'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '4', '-verboseStatus',
-                     '-o')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                   ("LUs Added: 2.", 0),
-                   ("LUs Removed: 4.", 0)]
-
-        fake_cli = self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.AddHluStatus.ABANDON,
-                        "Order should be in abandon status")
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.AddHluStatus.ABANDON,
-                        "Order should be in abandon status")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.AddHluStatus.ABANDON,
-                        "Order should be in abandon status")
-        self.assertTrue(orderList[3].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[3].hlu == 255,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[4].status ==
-                        emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[5].status ==
-                        emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[6].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-addhlu', '-gname', 'fakehost',
-                              '-hlus', '255', '-alus', '2', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True),
-                    mock.call('storagegroup', '-removehlu', '-gname',
-                              'fakehost', '-hlus', '4', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True)]
-        fake_cli.assert_has_calls(expected)
-
-    def test_handle_order_revert_2(self):
-        """Test handle the orders when there are revert after timeout.
-
-        Terminate connection to same alu right after
-        a initialize connection is running
-        """
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateRemoveOrder(alu=4))
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=2))
-        orderList.append(self.generateAddOrder(alu=5))
-        orderList.append(self.generateAddOrder(alu=6))
-        orderList.append(self.generateRemoveOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=6))
-        orderList.append(self.generateRemoveOrder(alu=1))
-        orderList.append(self.generateRemoveOrder(alu=4))
-        orderList.append(self.generateAddOrder(alu=5))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '2,1', '-alus', '2,5', '-verboseStatus',
-                     '-o'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '4', '-verboseStatus',
-                     '-o')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                   ("LUs Added: 2,5.", 0),
-                   ("LUs Removed: 4.", 0)]
-
-        old_max_luns = self.configuration.max_luns_per_storage_group
-        self.configuration.max_luns_per_storage_group = 4
-
-        fake_cli = self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.AddHluStatus.ABANDON,
-                        "Order should be in abandon status")
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.AddHluStatus.ABANDON,
-                        "Order should be in abandon status")
-        self.assertTrue(orderList[3].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[3].hlu == 2,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[4].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[4].hlu == 1,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[5].status ==
-                        emc_vnx_cli.AddHluStatus.NO_HLU_LEFT,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[6].status ==
-                        emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[7].status ==
-                        emc_vnx_cli.AddHluStatus.NO_HLU_LEFT,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[8].status ==
-                        emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[9].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[10].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[10].hlu == 1,
-                        "add hlu in batch failed")
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-addhlu', '-gname', 'fakehost',
-                              '-hlus', '2,1', '-alus', '2,5', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True),
-                    mock.call('storagegroup', '-removehlu', '-gname',
-                              'fakehost', '-hlus', '4', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True)]
-        fake_cli.assert_has_calls(expected)
-        self.configuration.max_luns_per_storage_group = old_max_luns
-
-    def test_handle_duplicated_order(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateRemoveOrder(alu=3))
-        orderList.append(self.generateRemoveOrder(alu=3))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '255', '-alus', '1', '-verboseStatus',
-                     '-o'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '3', '-verboseStatus',
-                     '-o')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                   ("LUs Added: 1.", 0),
-                   ("LUs Removed: 3.", 0)]
-
-        fake_cli = self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-        self.assertTrue(orderList[0].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[0].hlu == 255,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[1].status == emc_vnx_cli.AddHluStatus.OK
-                        and
-                        orderList[1].hlu == 255,
-                        "add hlu in batch failed")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        self.assertTrue(orderList[3].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "remove hlu in batch failed")
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-addhlu', '-gname', 'fakehost',
-                              '-hlus', '255', '-alus', '1', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True),
-                    mock.call('storagegroup', '-removehlu', '-gname',
-                              'fakehost', '-hlus', '3', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True)]
-
-        fake_cli.assert_has_calls(expected)
-
-    def test_handle_order_retry(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=2, tried=4))
-        orderList.append(self.generateRemoveOrder(alu=3))
-        orderList.append(self.generateRemoveOrder(alu=4, tried=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '255,254', '-alus', '1,2', '-verboseStatus',
-                     '-o'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '3,4', '-verboseStatus', '-o')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                   ("LUs Added: . LUs Not Added 1,2.", 0),
-                   ("LUs Removed: . LUs Not Removed 3,4.", 0)]
-
-        self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.AddHluStatus.NEW and
-                        orderList[0].tried == 1,
-                        "add hlu in batch failure is not detacted")
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.AddHluStatus.FAILURE,
-                        "add hlu in batch failure is not detacted")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.RemoveHluStatus.NEW and
-                        orderList[2].tried == 1,
-                        "remove hlu in batch failure is not detacted")
-        self.assertTrue(orderList[3].status ==
-                        emc_vnx_cli.RemoveHluStatus.FAILURE,
-                        "remove hlu in batch failure is not detacted")
-
-    def test_handle_order_no_hlu_left(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=2))
-        orderList.append(self.generateAddOrder(alu=3))
-        orderList.append(self.generateAddOrder(alu=5))
-        orderList.append(self.generateAddOrder(alu=5))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '2,1', '-alus', '1,2', '-verboseStatus',
-                     '-o')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                   ("LUs Added: 1,2.", 0)]
-        old_max_luns = self.configuration.max_luns_per_storage_group
-        self.configuration.max_luns_per_storage_group = 4
-        self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.AddHluStatus.OK,
-                        "add hlu in batch error")
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.AddHluStatus.OK,
-                        "add hlu in batch error")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK,
-                        "add hlu in batch error")
-        self.assertTrue(orderList[3].status ==
-                        emc_vnx_cli.AddHluStatus.NO_HLU_LEFT,
-                        "NO_HLU_LEFT is not detacted")
-        self.assertTrue(orderList[4].status ==
-                        emc_vnx_cli.AddHluStatus.NO_HLU_LEFT,
-                        "NO_HLU_LEFT is not detacted")
-        self.configuration.max_luns_per_storage_group = old_max_luns
-
-    def test_handle_order_not_in_SG(self):
-        orderList = []
-        orderList.append(self.generateRemoveOrder(alu=1))
-        orderList.append(self.generateRemoveOrder(alu=2, tried=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost')]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost')]
-
-        self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                        "add hlu in SG is not detacted")
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                        "add hlu in SG is not detacted")
-
-    def test_handle_order_in_batch_sg_preparation_failed(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        orderList.append(self.generateAddOrder(alu=2))
-        orderList.append(self.generateRemoveOrder(alu=3))
-        orderList.append(self.generateRemoveOrder(alu=4))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-create', '-gname', 'fakehost'),
-                    ('storagegroup', '-gname', 'fakehost', '-setpath',
-                     '-hbauid', 'iqn.1993-08.org.debian:01:222',
-                     '-sp', 'A', '-spport', 4, '-spvport', 0,
-                     '-ip', '10.0.0.2', '-host', 'fakehost', '-o')]
-        results = [("No Group", 83),
-                   ("Failure", 23),
-                   ("Failure", 23)]
-
-        self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-
-        executor(orderList)
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.AddHluStatus.FAILURE,
-                        "add hlu status is not changed")
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.AddHluStatus.FAILURE,
-                        "add hlu status is not changed")
-        self.assertTrue(orderList[2].status ==
-                        emc_vnx_cli.RemoveHluStatus.FAILURE,
-                        "remove hlu status is not changed")
-        self.assertTrue(orderList[3].status ==
-                        emc_vnx_cli.RemoveHluStatus.FAILURE,
-                        "remove hlu status is not changed")
-
-    def test_SG_auto_delete(self):
-        orderList = []
-        orderList.append(self.generateRemoveOrder(alu=3))
-        orderList.append(self.generateRemoveOrder(alu=4, tried=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '3,4', '-verboseStatus', '-o'),
-                    ('storagegroup', '-disconnecthost',
-                     '-host', 'fakehost',
-                     '-gname', 'fakehost', '-o'),
-                    ('storagegroup', '-destroy', '-gname', 'fakehost', '-o')]
-        results = [[self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost'),
-                    self.testData.STORAGE_GROUP_NO_MAP('fakehost')],
-                   ("LUs Removed: 3,4.", 0),
-                   SUCCEED,
-                   SUCCEED]
-        oldValue = self.configuration.destroy_empty_storage_group
-        self.configuration.destroy_empty_storage_group = True
-        fake_cli = self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-        executor(orderList)
-
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK)
-        self.assertTrue(orderList[1].status ==
-                        emc_vnx_cli.RemoveHluStatus.OK)
-
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-removehlu', '-gname',
-                              'fakehost', '-hlus', '3,4', '-verboseStatus',
-                              '-o', poll=False,
-                              retry_disable=True),
-                    mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-disconnecthost',
-                              '-host', 'fakehost',
-                              '-gname', 'fakehost', '-o'),
-                    mock.call('storagegroup', '-destroy',
-                              '-gname', 'fakehost', '-o')]
-
-        fake_cli.assert_has_calls(expected)
-        self.configuration.destroy_empty_storage_group = oldValue
-
-    def test_terminate_connection_with_no_sg(self):
-        orderList = []
-        orderList.append(self.generateRemoveOrder(alu=3))
-        orderList.append(self.generateRemoveOrder(alu=4, tried=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost')]
-        results = [("no storagegroup", 83)]
-        self.configuration.destroy_empty_storage_group = True
-        fake_cli = self.driverSetup(commands, results)
-
-        executor = self.get_batch_worker_executor(
-            self.testData.connector
-        )
-        executor(orderList)
-
-        self.assertEqual(emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                         orderList[0].status)
-        self.assertEqual(emc_vnx_cli.RemoveHluStatus.HLU_NOT_IN_SG,
-                         orderList[1].status)
-
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True)]
-        fake_cli.assert_has_calls(expected)
-        self.configuration.destroy_empty_storage_group = False
-
-    def test_initiator_auto_registration(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '255', '-alus', '1', '-verboseStatus',
-                     '-o')]
-        results = [[("No Group", 83),
-                    self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost')],
-                   ("LUs Added: 1.", 0)]
-        fake_cli = self.driverSetup(commands, results)
-        executor = self.get_batch_worker_executor(self.testData.connector)
-
-        executor(orderList)
-
-        self.assertTrue(orderList[0].status ==
-                        emc_vnx_cli.AddHluStatus.OK,
-                        "add hlu in batch failed")
-
-        expected = [mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-create', '-gname', 'fakehost'),
-                    mock.call('storagegroup', '-gname', 'fakehost', '-setpath',
-                              '-hbauid', 'iqn.1993-08.org.debian:01:222',
-                              '-sp', 'A', '-spport', 4, '-spvport', 0,
-                              '-ip', '10.0.0.2', '-host', 'fakehost', '-o'),
-                    mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                              poll=True),
-                    mock.call('storagegroup', '-addhlu', '-gname', 'fakehost',
-                              '-hlus', '255', '-alus', '1', '-verboseStatus',
-                              '-o',
-                              poll=False,
-                              retry_disable=True)]
-
-        fake_cli.assert_has_calls(expected)
-
-
-@mock.patch('eventlet.sleep', mock.Mock())
-@mock.patch("random.shuffle",
-            mock.Mock(return_value=0))
-class BatchAttachDetachFCTestCase(BatchAttachDetachTestCaseBase):
-
-    def generateDriver(self, conf):
-        conf.attach_detach_batch_interval = 20
-        return EMCCLIFCDriver(configuration=conf)
-
-    def test_initialize_connection(self):
-        test_volume = self.testData.test_volume.copy()
-        td = self.testData
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(
-                    emc_vnx_cli.AddHluStatus.OK,
-                    hlu=3,
-                    payload={
-                        'raw_output': td.STORAGE_GROUP_HAS_MAP('fakehost')[0]})
-
-        commands = [('port', '-list', '-gname', 'fakehost')]
-        results = [self.testData.FAKEHOST_PORTS]
-
-        fake_cli = self.driverSetup(commands, results)
-
-        with mock.patch(
-                'cinder.volume.drivers.emc.emc_vnx_cli.'
-                'EMCVnxCliBase.get_batch_worker',
-                mock.Mock(return_value=fake_batch_worker())):
-            self.driver.initialize_connection(
-                test_volume,
-                self.testData.connector)
-
-            expected = [mock.call('port', '-list', '-gname', 'fakehost')]
-            fake_cli.assert_has_calls(expected)
-
-    def test_initiator_auto_registration(self):
-        orderList = []
-        orderList.append(self.generateAddOrder(alu=1))
-        old_auto_registration = self.configuration.initiator_auto_registration
-        self.configuration.initiator_auto_registration = True
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('port', '-list', '-sp'),
-                    ('storagegroup', '-addhlu', '-gname', 'fakehost',
-                     '-hlus', '255', '-alus', '1', '-verboseStatus',
-                     '-o')]
-        results = [[("No Group", 83),
-                    self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost')],
-                   self.testData.FC_PORTS,
-                   ("LUs Added: 1.", 0)]
-
-        fake_cli = self.driverSetup(commands, results)
-        executor = self.get_batch_worker_executor(self.testData.connector)
-        executor(orderList)
-
-        self.assertTrue(
-            orderList[0].status == emc_vnx_cli.AddHluStatus.OK,
-            "add hlu in batch failed")
-
-        expected = [
-            mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                      poll=True),
-            mock.call('storagegroup', '-create', '-gname', 'fakehost'),
-            mock.call('port', '-list', '-sp'),
-            mock.call('storagegroup', '-gname', 'fakehost',
-                      '-setpath', '-hbauid',
-                      '22:34:56:78:90:12:34:56:12:34:56:78:'
-                      '90:12:34:56',
-                      '-sp', 'A', '-spport', '0', '-ip', '10.0.0.2',
-                      '-host', 'fakehost', '-o'),
-            mock.call('storagegroup', '-gname', 'fakehost',
-                      '-setpath', '-hbauid',
-                      '22:34:56:78:90:54:32:16:12:34:56:78:'
-                      '90:54:32:16',
-                      '-sp', 'A', '-spport', '0', '-ip', '10.0.0.2',
-                      '-host', 'fakehost', '-o'),
-
-            mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                      poll=True),
-            mock.call('storagegroup', '-addhlu', '-gname', 'fakehost',
-                      '-hlus', '255', '-alus', '1',
-                      '-verboseStatus', '-o',
-                      poll=False,
-                      retry_disable=True)
-        ]
-
-        fake_cli.assert_has_calls(expected)
-        self.configuration.initiator_auto_registration = old_auto_registration
-
-    @mock.patch(
-        "cinder.zonemanager.fc_san_lookup_service.FCSanLookupService." +
-        "get_device_mapping_from_network",
-        mock.Mock(return_value=EMCVNXCLIDriverTestData.device_map))
-    @mock.patch('random.randint',
-                mock.Mock(return_value=0))
-    def test_initialize_connection_fc_auto_zoning(self):
-        # Test for auto zoning
-        self.configuration.initiator_auto_registration = False
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    self.testData.GETFCPORT_CMD()]
-        results = [self.testData.STORAGE_GROUP_HAS_MAP('fakehost'),
-                   self.testData.FC_PORTS]
-        fake_cli = self.driverSetup(commands, results)
-        self.driver.cli.zonemanager_lookup_service = \
-            FCSanLookupService(configuration=self.configuration)
-        td = self.testData
-
-        class fake_batch_worker(object):
-            def submit(self, order):
-                order.update_status(
-                    emc_vnx_cli.AddHluStatus.OK,
-                    hlu=1,
-                    payload={
-                        'raw_output': td.STORAGE_GROUP_HAS_MAP(
-                            'fakehost')[0]})
-
-        with mock.patch(
-                'cinder.volume.drivers.emc.emc_vnx_cli.'
-                'EMCVnxCliBase.get_batch_worker',
-                mock.Mock(return_value=fake_batch_worker())):
-            conn_info = self.driver.initialize_connection(
-                self.testData.test_volume,
-                self.testData.connector)
-
-            self.assertEqual(EMCVNXCLIDriverTestData.i_t_map,
-                             conn_info['data']['initiator_target_map'])
-            self.assertEqual(['1122334455667777'],
-                             conn_info['data']['target_wwn'])
-            expected = [mock.call('storagegroup', '-list', '-gname',
-                                  'fakehost', poll=True),
-                        mock.call('port', '-list', '-sp', poll=True)]
-            fake_cli.assert_has_calls(expected)
-
-    @mock.patch(
-        "cinder.zonemanager.fc_san_lookup_service.FCSanLookupService." +
-        "get_device_mapping_from_network",
-        mock.Mock(return_value=EMCVNXCLIDriverTestData.device_map))
-    def test_terminate_connection_remove_zone_true(self):
-        orderList = []
-        orderList.append(self.generateRemoveOrder(alu=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '1', '-verboseStatus', '-o'),
-                    self.testData.GETFCPORT_CMD(),
-                    ]
-        results = [[self.testData.STORAGE_GROUP_HAS_MAP('fakehost'),
-                    self.testData.STORAGE_GROUP_REGISTED_NO_MAP('fakehost')],
-                   ("LUs Removed: 1.", 0),
-                   self.testData.FC_PORTS]
-
-        fake_cli = self.driverSetup(commands, results)
-        self.driver.cli.zonemanager_lookup_service = \
-            FCSanLookupService(configuration=self.configuration)
-
-        with mock.patch(
-                "cinder.zonemanager.fc_san_lookup_service.FCSanLookupService."
-                "get_device_mapping_from_network") as get_device_mapping:
-            get_device_mapping.side_effect = [
-                EMCVNXCLIDriverTestData.device_map]
-            executor = self.get_batch_worker_executor(self.testData.connector)
-            executor(orderList)
-
-            self.assertTrue(
-                orderList[0].status == emc_vnx_cli.RemoveHluStatus.OK,
-                "Remove hlu in batch failed")
-            initiator_target_map = orderList[0].payload
-            self.assertEqual(EMCVNXCLIDriverTestData.i_t_map,
-                             initiator_target_map)
-            get_device_mapping.assert_called_with(
-                self.testData.connector['wwpns'], ['5006016008600195'])
-
-            expected = [
-                mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                          poll=True),
-                mock.call('storagegroup', '-removehlu', '-gname', 'fakehost',
-                          '-hlus', '1', '-verboseStatus', '-o',
-                          poll=False,
-                          retry_disable=True),
-                mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                          poll=True),
-                mock.call('port', '-list', '-sp', poll=False)]
-            fake_cli.assert_has_calls(expected)
-
-    @mock.patch(
-        "cinder.zonemanager.fc_san_lookup_service.FCSanLookupService." +
-        "get_device_mapping_from_network",
-        mock.Mock(return_value=EMCVNXCLIDriverTestData.device_map))
-    def test_terminate_connection_autozone_not_remove(self):
-        orderList = []
-        orderList.append(self.generateRemoveOrder(alu=1))
-        commands = [('storagegroup', '-list', '-gname', 'fakehost'),
-                    ('storagegroup', '-removehlu', '-gname', 'fakehost',
-                     '-hlus', '1', '-verboseStatus', '-o')
-                    ]
-        results = [[self.testData.STORAGE_GROUP_HAS_MAP('fakehost'),
-                    self.testData.STORAGE_GROUP_HAS_MAP_3('fakehost')],
-                   ("LUs Removed: 1.", 0)]
-
-        fake_cli = self.driverSetup(commands, results)
-        self.driver.cli.zonemanager_lookup_service = \
-            FCSanLookupService(configuration=self.configuration)
-
-        executor = self.get_batch_worker_executor(self.testData.connector)
-        executor(orderList)
-
-        self.assertTrue(
-            orderList[0].status == emc_vnx_cli.RemoveHluStatus.OK,
-            "Remove hlu in batch failed")
-
-        self.assertTrue(orderList[0].payload is None,
-                        'initiator_target_map should be populated.')
-        expected = [
-            mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                      poll=True),
-            mock.call('storagegroup', '-removehlu', '-gname', 'fakehost',
-                      '-hlus', '1', '-verboseStatus', '-o',
-                      poll=False,
-                      retry_disable=True),
-            mock.call('storagegroup', '-list', '-gname', 'fakehost',
-                      poll=True)]
-        fake_cli.assert_has_calls(expected)

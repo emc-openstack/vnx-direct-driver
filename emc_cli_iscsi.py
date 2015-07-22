@@ -17,7 +17,8 @@ iSCSI Drivers for EMC VNX array based on CLI.
 
 """
 
-from cinder.openstack.common import log as logging
+from oslo_log import log as logging
+
 from cinder.volume import driver
 from cinder.volume.drivers.emc import emc_vnx_cli
 
@@ -27,19 +28,31 @@ LOG = logging.getLogger(__name__)
 class EMCCLIISCSIDriver(driver.ISCSIDriver):
     """EMC ISCSI Drivers for VNX using CLI.
 
-    New Features in 4.*.*:
-        4.0.0 - Advanced LUN Features (Compression Support,
+    Version history:
+        1.0.0 - Initial driver
+        2.0.0 - Thick/thin provisioning, robust enhancement
+        3.0.0 - Array-based Backend Support, FC Basic Support,
+                Target Port Selection for MPIO,
+                Initiator Auto Registration,
+                Storage Group Auto Deletion,
+                Multiple Authentication Type Support,
+                Storage-Assisted Volume Migration,
+                SP Toggle for HA
+        3.0.1 - Security File Support
+        4.0.0 - Advance LUN Features (Compression Support,
                 Deduplication Support, FAST VP Support,
                 FAST Cache Support), Storage-assisted Retype,
                 External Volume Management, Read-only Volume,
                 FC Auto Zoning
         4.1.0 - Consistency group support
-        4.2.0 - Performance enhancement, LUN Number Threshold Support,
+        5.0.0 - Performance enhancement, LUN Number Threshold Support,
                 Initiator Auto Deregistration,
                 Force Deleting LUN in Storage Groups,
-                robust enhancement,
-                Pool-aware scheduler support,
-                Batch processing for volume attach/detach
+                robust enhancement
+        5.1.0 - iSCSI multipath enhancement
+        5.2.0 - Pool-aware scheduler support
+        5.3.0 - Consistency group modification support
+        5.4.0 - White list target ports support
     """
 
     def __init__(self, *args, **kwargs):
@@ -109,7 +122,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
 
         The iscsi driver returns a driver_volume_type of 'iscsi'.
         the format of the driver data is defined in vnx_get_iscsi_properties.
-        Example return value::
+        Example return value (multipath is not enabled)::
 
             {
                 'driver_volume_type': 'iscsi'
@@ -118,6 +131,20 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                     'target_iqn': 'iqn.2010-10.org.openstack:volume-00000001',
                     'target_portal': '127.0.0.0.1:3260',
                     'target_lun': 1,
+                    'access_mode': 'rw'
+                }
+            }
+
+        Example return value (multipath is enabled)::
+
+            {
+                'driver_volume_type': 'iscsi'
+                'data': {
+                    'target_discovered': True,
+                    'target_iqns': ['iqn.2010-10.org.openstack:volume-00001',
+                                    'iqn.2010-10.org.openstack:volume-00002'],
+                    'target_portals': ['127.0.0.1:3260', '127.0.1.1:3260'],
+                    'target_luns': [1, 1],
                     'access_mode': 'rw'
                 }
             }
@@ -193,3 +220,15 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
     def get_pool(self, volume):
         """Returns the pool name of a volume."""
         return self.cli.get_pool(volume)
+
+    def update_consistencygroup(self, context, group,
+                                add_volumes,
+                                remove_volumes):
+        """Updates LUNs in consistency group."""
+        return self.cli.update_consistencygroup(context, group,
+                                                add_volumes,
+                                                remove_volumes)
+
+    def unmanage(self, volume):
+        """Unmanages a volume."""
+        self.cli.unmanage(volume)

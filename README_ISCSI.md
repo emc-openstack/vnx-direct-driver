@@ -25,7 +25,7 @@ The Navisphere CLI (NaviSecCLI) is a Command Line Interface (CLI) used for manag
 
 ## Supported OpenStack Release
 
-This driver supports Juno release.
+This driver supports Kilo release.
 
 ## Requirements
 
@@ -48,6 +48,7 @@ The following operations are supported:
 * Get volume statistics
 * Create and delete consistency groups
 * Create and delete consistency group snapshots
+* Modify consistency group
 
 ## Preparation
 
@@ -63,13 +64,12 @@ Navisphere CLI needs to be installed on all Block Storage nodes within an OpenSt
 
 ### Install EMC VNX iSCSI driver
 
-EMC VNX iSCSI driver provided in the installer package consists of 3 python files:
+EMC VNX iSCSI driver provided in the installer package consists of two python files:
 
         emc_vnx_cli.py
         emc_cli_iscsi.py
-        queueworker.py
-
-Copy the 3 files above to the `cinder/volume/drivers/emc/` directory of the OpenStack node(s) where cinder-volume is running.
+                                
+Copy the two files above to the `cinder/volume/drivers/emc/` directory of the OpenStack node(s) where cinder-volume is running.
 
 ### Register with VNX
 
@@ -95,21 +95,21 @@ The steps mentioned below are for the compute nodes. Please follow the same step
 * Assume `iqn.1993-08.org.debian:01:1a2b3c4d5f6g` is the initiator name of the compute node. Register `iqn.1993-08.org.debian:01:1a2b3c4d5f6g` in Unisphere
     * Login Unisphere, go to `FNM0000000000->Hosts->Initiators`,
     * Refresh and wait until the initiator `iqn.1993-08.org.debian:01:1a2b3c4d5f6g` with SP Port `A-8v0` appears.
-    * Click the `Register` button, select `CLARiiON/VNX` and enter the host name (which is the output of the Linux command `hostname`) and IP address:
-	    * Hostname : myhost1
-	    * IP : 10.10.61.1
-	    * Click Register. 
+    * Click the `Register` button, select `CLARiiON/VNX` and enter the host name (which is the output of the linux command `hostname`) and IP address:
+        * Hostname : myhost1
+        * IP : 10.10.61.1
+        * Click Register. 
     * Now the host 10.10.61.1 will appear under Hosts->Host List as well.
 
 * Logout iSCSI on the node:
 
-		$ sudo iscsiadm -m node -u
+        $ sudo iscsiadm -m node -u
 
 * Login VNX from the compute node using the target corresponding to the SPB port:
 
         $ sudo iscsiadm -m node -T iqn.1992-04.com.emc:cx.apm01234567890.b8 -p 10.10.61.36 -l
 
-* Register the initiator with the SPB port in Unisphere.
+* Register the initiator with the SPB port in Unisphere .
 
 * Logout iSCSI on the node:
 
@@ -119,14 +119,14 @@ The steps mentioned below are for the compute nodes. Please follow the same step
 
 __Notes:__ When the driver notices that there is no existing storage group that has the host name as the storage group name, it will create the storage group and also add the compute node's or Block Storage nodes' registered initiators into the storage group.
 If the driver notices that the storage group already exists, it will assume that the registered initiators have also been put into it and skip the operations above for better performance.
-It is recommended that the storage administrator doesn't create the storage group manually and instead relies on the driver for the preparation. If the storage administrator do need to create the storage group manually for some special requirements, the correct registered initiators should be put into the storage group as well (otherwise the following volume attaching operations will fail).
+It is recommended that the storage administrator does not create the storage group manually and instead relies on the driver for the preparation. If the storage administrator needs to create the storage group manually for some special requirements, the correct registered initiators should be put into the storage group as well (otherwise the following volume attaching operations will fail).
 
 
 ## Backend configuration
 
 Make the following changes in the configuration file `/etc/cinder/cinder.conf`:
 
-The configuration options below are specific for EMC VNX iSCSI driver
+The configuration options below are specific for EMC VNX iSCSI driver 
 
         storage_vnx_pool_name = Pool_01_SAS
         san_ip = 10.10.72.41
@@ -147,7 +147,8 @@ The configuration options below are specific for EMC VNX iSCSI driver
         destroy_empty_storage_group = False
         #"node1hostname" and "node2hostname" shoule be the full hostnames of the nodes.(Try linux command `hostname` to obtain)
         iscsi_initiators = {"node1hostname":["10.0.0.1", "10.0.0.2"],"node2hostname":["10.0.0.3"]}
-        use_multi_iscsi_portals=False
+        # max lun number allowed to create in a storage pool
+        max_luns_per_storage_pool = 1000
         [database]
         max_pool_size=20
         max_overflow=30
@@ -157,7 +158,7 @@ The configuration options below are specific for EMC VNX iSCSI driver
 * where `san_ip` is one of the SP IP address of the VNX array and `san_secondary_ip` is the other SP IP address of the VNX array. `san_ip` is a mandatory field which provides the primary connection to VNX array. And `san_secondary_ip` is an optional field which is for high availability (HA). In case that one SP is down, the other SP can be connected automatically. 
 * where `Pool_01_SAS` is the pool from which the user wants to create volumes. The pools can be created using Unisphere for VNX. Refer to the "Multiple Pools Support" on how to manage multiple pools
 * where `storage_vnx_security_file_dir` is the directory path of the VNX security file. Make sure the security file is generated following the steps in the authentication section
-* where `iscsi_initiators` is a dictionary of IP addressess of the iSCSI initiator ports on all OpenStack nodes which want to connect to VNX via iSCSI. If this option is configured, the driver will leverage this information to find an accessible iSCSI target portal for the initiator when attaching volumes. Otherwise, the iSCSI target portal will be chosen in a relative random way.
+* where `iscsi_initiators` is a dictionary of IP addressess of the iSCSI initiator ports on all OpenStack nodes which want to connect to VNX via iSCSI. If this option is configured and multipath is not enabled by nova, the driver will leverage this information to find an accessible iSCSI target portal for the initiator when attaching volumes. Otherwise, the iSCSI target portal will be chosen in a relative random way. If multipath is enabled by nova, this option will be ignored and mutilple iSCSI target protals will be returned.
 * Restart the cinder-volume service to make the configuration change take effect.
 
 ## Authentication
@@ -198,7 +199,6 @@ Alternatively, the credentials can be specified in /etc/cinder/cinder.conf by th
 * It does not suggest to deploy the driver on a compute node if "cinder upload-to-image --force True" is used against an in-use volume. Otherwise, "cinder upload-to-image --force True" will terminate the data access of the vm instance to the volume.
 * The driver caches the iSCSI ports information, so that the administrator should restart the cinder-volume service or wait 5 minutes before any volume attachment operation after changing the iSCSI port configurations. Otherwise, the attachment may fail because the old iSCSI port configurations were used.
 * VNX does not support to extend the thick volume which has a snapshot. If the user tries to extend a volume which has a snapshot, the status of the volume would change to "error_extending".
-* VNX does not support to add compressed volumes into consistency groups.
 
 ## Provisioning type (thin, thick, deduplicated and compressed)
 
@@ -211,10 +211,10 @@ User can specify extra spec key `storagetype:provisioning` in volume type to set
   `thick` provisioning type means the volume is fully provisioned
 
 * **deduplicated:**
-  `deduplicated` provisioning type means the volume is virtually provisioned and the deduplication is enabled on it. The administrator shall go to VNX to configure the system level deduplication settings. To create a deduplicated volume, the VNX Deduplication license should be activated on VNX first, and use key `deduplication_support=True` to let Block Storage scheduler find a volume backend which manages a VNX with deduplication license activated
+  `deduplicated` provisioning type means the volume is virtually provisioned and the deduplication is enabled on it. The administrator shall go to VNX to configure the system level deduplication settings. To create a deduplicated volume, the VNX Deduplication license should be activated on VNX first, and use key deduplication_support=True to let Block Storage scheduler find a volume back end which manages a VNX with deduplication license activated
 
 * **compressed:**
-  `compressed` provisioning type means the volume is virtually provisioned and the compression is enabled on it. The administrator shall go to the VNX to configure the system level compression settings. To create a compressed volume, the VNX Compression license should be activated on VNX first, and use key `compression_support=True` to let Block Storage scheduler find a volume backend which manages a VNX with Compression license activated. VNX does not support to create a snapshot on a compressed volume. If the user tries to create a snapshot on a compressed volume, the operation would fail and OpenStack would show the new snapshot in error state
+  `compressed` provisioning type means the volume is virtually provisioned and the compression is enabled on it. The administrator shall go to the VNX to configure the system level compression settings. To create a compressed volume, the VNX Compression license should be activated on VNX first, and use key compression_support=True to let Block Storage scheduler find a volume back end which manages a VNX with Compression license activated. VNX does not support to create a snapshot on a compressed volume. If the user tries to create a snapshot on a compressed volume, the operation would fail and OpenStack would show the new snapshot in error state
 
 Here is an example about how to create a volume with provisioning type. First create a volume type and specify storage pool in the extra spec, then create a volume with this volume type.
 
@@ -234,7 +234,7 @@ During volume creation, if the driver finds `storagetype:provisioning` in the ex
 
 ## Fully automated storage tiering support
 
-VNX supports fully automated storage tiering which requires the FAST license activated on the VNX. The OpenStack administrator can use the extra spec key `storagetype:tiering` to set the tiering policy of a volume and use the key `fast_support=True` to let Block Storage scheduler find a volume backend which manages a VNX with FAST license activated. Here are the five supported values for the extra spec key `storagetype:tiering`:
+VNX supports fully automated storage tiering which requires the FAST license activated on the VNX. The OpenStack administrator can use the extra spec key `storagetype:tiering` to set the tiering policy of a volume and use the key fast_support=True to let Block Storage scheduler find a volume back end which manages a VNX with FAST license activated. Here are the five supported values for the extra spec key `storagetype:tiering`:
 
         StartHighThenAuto (Default option)
         Auto
@@ -253,13 +253,13 @@ Here is an example about how to create a volume with tiering policy:
 
 ## FAST Cache support
 
-VNX has FAST Cache feature which requires the FAST Cache license activated on the VNX. The OpenStack administrator can use the extra spec key `fast_cache_enabled` to choose whether to create a volume in a storage pool with FAST Cache enabled.
-The value of the extra spec key `fast_cache_enabled` is either `True` or `False`. When creating a volume, if the key `fast_cache_enabled=True` is set in the volume type, the volume will be created by a backend which manages at least a storage pool with FAST Cache enabled)
+VNX has FAST Cache feature which requires the FAST Cache license activated on the VNX. The OpenStack administrator can use the extra spec key `fast_cache_enabled` to choose whether to create a volume on the volume back end which manages a pool with FAST Cache enabled.
+The value of the extra spec key `fast_cache_enabled` is either 'True' or 'False'. When creating a volume, if the key `fast_cache_enabled` is set in the volume type, the volume will be created by a back end which manages a pool with FAST Cache enabled)
 
 ## Storage group automatic deletion
 
-For volume attaching, the driver has a storage group on VNX for each compute node hosting the vm instances which are going to consume VNX Block Storage (using compute node's hostname as storage group's name). All the volumes attached to the vm instances in a computer node will be put into the storage group. If `destroy_empty_storage_group=True`, the driver will remove the empty storage group after its last volume is detached.
-For data safety, it does not suggest to set `destroy_empty_storage_group=True` unless the VNX is exclusively managed by one Block Storage node because consistent `lock_path` is required for operation synchronization for this behavior.
+For volume attaching, the driver has a storage group on VNX for each compute node hosting the vm instances which are going to consume VNX Block Storage (using compute node's hostname as storage group's name). All the volumes attached to the vm instances in a computer node will be put into the storage group. If destroy_empty_storage_group=True, the driver will remove the empty storage group after its last volume is detached.
+For data safety, it does not suggest to set destroy_empty_storage_group=True unless the VNX is exclusively managed by one Block Storage node because consistent lock_path is required for operation synchronization for this behavior.
 
 ## EMC storage-assisted volume migration
 
@@ -268,43 +268,53 @@ EMC VNX iSCSI driver supports storage-assisted volume migration, when the user s
 
 In following scenarios, VNX storage-assisted volume migration will not be triggered:
 
-1. Volume migration between backends with different storage protocol, ex, FC and iSCSI
-2. Volume migration from pool-based backend to array-based backend
-3. Volume is to be migrated across arrays
+1. Volume migration between back ends with different storage protocol, ex, FC and iSCSI
+2. Volume is to be migrated across arrays
 
 ## Initiator auto registration
 
-If `initiator_auto_registration=True`, the driver will automatically register iSCSI initiators with all working iSCSI target ports on the VNX array during volume attaching (The driver will skip those initiators that have already been registered)
+When `initiator_auto_registration=True`, the driver will automatically register iSCSI initiators to all working iSCSI target ports of the VNX array during volume attaching (The driver will skip those initiators that have already been registered) if the option `io_port_list` is not specified in cinder.conf.
 
-If the user wants to register the initiators with some specific ports but not register with the other ports, this functionality should be disabled.
+When a comma-separated list is given to `io_port_list`, API `initialize_connection()` will only register the initiator to the ports specified in the list and only return iSCSI target port(s) which belong to the target ports in the `io_port_list` instead of all target ports.When `use_multi_iscsi_portals` is also set to `True`, all working iSCSI target portals in `io_port_list` will be returned via `target_iqns` and `target_portals` in `connection_info` structure.
+
+Here is an example
+
+    io_port_list=a-1-0,B-3-0
+
+`a` or `B` is **Storage Processor**, the first numbers `1` and `3` are **Port ID** and the second number `0` is **Virtual Port ID**
+
+Note:
+
+* Rather than de-registered, the registered ports will be simply bypassed whatever they are in `io_port_list` or not.
+* Driver will raise an exception if ports in `io_port_list` are not existed in VNX during startup.
 
 ## Initiator auto deregistration
 
-Enabling storage group automatic deletion is the precondition of this function. If `initiator_auto_deregistration=True` is set, the driver will deregister all the iSCSI initiators of the host after its storage group is deleted.
+Enabling storage group automatic deletion is the precondition of this function. If initiator_auto_deregistration=True is set, the driver will deregister all the iSCSI initiators of the host after its storage group is deleted.
 
 ## Read-only volumes
 
 OpenStack support read-only volumes. The following command can be used to set a volume as read-only.
 
-        cinder readonly-mode-update <volume> True
+        cinder --os-username admin --os-tenant-name admin readonly-mode-update <volume> True
 
 After a volume is marked as read-only, the driver will forward the information when a hypervisor is attaching the volume and the hypervisor will have an implementation-specific way to make sure the volume is not written.
 
 ##  Volume number threshold
 
-In VNX, there is limit on the maximum number of pool volumes that can be created in the system. When the limit is reached, no more pool volumes can be created even if there is remaining capacity in the storage pool. In other words, if the scheduler dispatches a volume creation request to a backend that has free capacity but reaches the limit, the backend will fail to create the corresponding volume.
+In VNX, there is limit on the maximum number of pool volumes that can be created in the system. When the limit is reached, no more pool volumes can be created even if there is remaining capacity in the storage pool. In other words, if the scheduler dispatches a volume creation request to a back end that has free capacity but reaches the limit, the back end will fail to create the corresponding volume.
 
-The default value of `check_max_pool_luns_threshold` is `False`. When `check_max_pool_luns_threshold=True`, the pool-based backend will check the limit and will report 0 free capacity to the scheduler if the limit is reached. So the scheduler will be able to skip this kind of pool-based backend that runs out of pool volume number.
+The default value of `check_max_pool_luns_threshold` is `False`. When `check_max_pool_luns_threshold=True`, the pool-based back end will check the limit and will report 0 free capacity to the scheduler if the limit is reached. So the scheduler will be able to skip this kind of pool-based back end that runs out of the pool volume number.
 
 ## Multiple pools support
 
-When a storage pool is configured for a Block Storage backend (named as pool-based backend), only that storage pool will be used by that Block Storage backend.
-If `storage_vnx_pool_name` is not configured, then all the pools on the VNX array will be used by that Block Storage backend and the scheduler will choose which pool to place the volume based on the capacities and capabilities of the pools.
-This kind of Block Storage backend is named as array-based backend.
+When a storage pool is configured for a Block Storage back end (named as pool-based back end), only that storage pool will be used by that Block Storage back end.
+If `storage_vnx_pool_name` is not configured, then all the pools on the VNX array will be used by that Block Storage back end and the scheduler will choose which pool to place the volume based on the capacities and capabilities of the pools.
+This kind of Block Storage back end is named as array-based back end.
 
 To adhere to the official pool-aware scheduler framework, the old extra spec key `storagetype:pool` is obsoleted and it will be ignored by the newer driver. `pool_name` is the replacement offered by pool-aware scheduler framework.
 
-Here is an example about configuration of array-based backend.
+Here is an example about configuration of array-based back end.
 
         san_ip = 10.10.72.41
         #Directory path that contains the VNX security file. Make sure the security file is generated first
@@ -342,7 +352,8 @@ Here is an example about the volume type creation:
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
-        use_multi_iscsi_portals=False
+        io_port_list=a-1-0,B-3-0
+
         [backendB]
         storage_vnx_pool_name = Pool_02_SAS
         san_ip = 10.10.26.101
@@ -354,7 +365,8 @@ Here is an example about the volume type creation:
         volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
         destroy_empty_storage_group = False
         initiator_auto_registration=True
-        use_multi_iscsi_portals=False
+        io_port_list=a-1-0,B-3-0
+
         [database]
 
         max_pool_size=20
@@ -362,24 +374,10 @@ Here is an example about the volume type creation:
 
 For more details on multi-backends, see [OpenStack Cloud Administration Guide](http://docs.openstack.org/admin-guide-cloud/content/multi_backend.html)
 
-## Batch Processing for Volume Attaching/Detaching
-
-Batch Processing is introduced to improve the performance of volume attaching/detaching. The driver accumulates the concurrent attaching/detaching requests and then serves the requests in batch later. Because some duplicated operations will be removed, the whole process will be more efficient. The minimum serving time of a request may increase since time is needed for requests to accumulate but the maximum serving time will be reduced as long as the time for accumulation is not excessively long. Batch processing is disabled by default.
-Option `attach_detach_batch_interval` within the backend section is used to control this support.
-
-* `attach_detach_batch_interval=-1`: Batch processing is disabled. This is the default value.
-
-* `attach_detach_batch_interval=<Number of seconds>`: Batch processing is enabled and worker threads will sleep `<Number of seconds>` for the requests to accumulate before it serves them in batch.
-
 ## Force delete volumes in storage group
 
 Some `available` volumes may remain in storage group on the VNX array due to some OpenStack timeout issue. But the VNX array do not allow the user to delete the volumes which are in storage group. Option `force_delete_lun_in_storagegroup` is introduced to allow the user to delete the `available` volumes in this tricky situation.
 
-When `force_delete_lun_in_storagegroup=True` in the backend section, the driver will move the volumes out of storage groups and then delete them if the user tries to delete the volumes remain in storage group on the VNX array.
+When `force_delete_lun_in_storagegroup=True` in the back-end section, the driver will move the volumes out of storage groups and then delete them if the user tries to delete the volumes that remain in storage group on the VNX array.
 
 The default value of `force_delete_lun_in_storagegroup` is `False`.
-
-## Multiple iSCSI Target Portals
-This is a temporary solution before OpenStack officially supports multiple iSCSI target portals in Kilo. So it is will not be supported in later the driver for Kilo.
-
-When `use_multi_iscsi_portals=True`, the driver can return multiple iSCSI target portals when attach a volume to a virtual machine instance. Thus the corresponding customized Nova logic can try alternative portals and avoid the single path failure.

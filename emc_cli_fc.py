@@ -17,11 +17,11 @@ Fibre Channel Driver for EMC VNX array based on CLI.
 
 """
 
-from cinder.openstack.common import log as logging
+from oslo_log import log as logging
+
 from cinder.volume import driver
 from cinder.volume.drivers.emc import emc_vnx_cli
-from cinder.zonemanager.utils import AddFCZone
-from cinder.zonemanager.utils import RemoveFCZone
+from cinder.zonemanager import utils as zm_utils
 
 
 LOG = logging.getLogger(__name__)
@@ -30,19 +30,31 @@ LOG = logging.getLogger(__name__)
 class EMCCLIFCDriver(driver.FibreChannelDriver):
     """EMC FC Driver for VNX using CLI.
 
-    New Features in 4.*.*:
-        4.0.0 - Advanced LUN Features (Compression Support,
+    Version history:
+        1.0.0 - Initial driver
+        2.0.0 - Thick/thin provisioning, robust enhancement
+        3.0.0 - Array-based Backend Support, FC Basic Support,
+                Target Port Selection for MPIO,
+                Initiator Auto Registration,
+                Storage Group Auto Deletion,
+                Multiple Authentication Type Support,
+                Storage-Assisted Volume Migration,
+                SP Toggle for HA
+        3.0.1 - Security File Support
+        4.0.0 - Advance LUN Features (Compression Support,
                 Deduplication Support, FAST VP Support,
                 FAST Cache Support), Storage-assisted Retype,
                 External Volume Management, Read-only Volume,
                 FC Auto Zoning
         4.1.0 - Consistency group support
-        4.2.0 - Performance enhancement, LUN Number Threshold Support,
+        5.0.0 - Performance enhancement, LUN Number Threshold Support,
                 Initiator Auto Deregistration,
                 Force Deleting LUN in Storage Groups,
-                robust enhancement,
-                Pool-aware scheduler support,
-                Batch processing for volume attach/detach
+                robust enhancement
+        5.1.0 - iSCSI multipath enhancement
+        5.2.0 - Pool-aware scheduler support
+        5.3.0 - Consistency group modification support
+        5.4.0 - White list target ports support
     """
 
     def __init__(self, *args, **kwargs):
@@ -108,7 +120,7 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
         """Make sure volume is exported."""
         pass
 
-    @AddFCZone
+    @zm_utils.AddFCZone
     def initialize_connection(self, volume, connector):
         """Initializes the connection and returns connection info.
 
@@ -159,7 +171,7 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
                   % {'conn_info': conn_info})
         return conn_info
 
-    @RemoveFCZone
+    @zm_utils.RemoveFCZone
     def terminate_connection(self, volume, connector, **kwargs):
         """Disallow connection from connector."""
         conn_info = self.cli.terminate_connection(volume, connector)
@@ -229,3 +241,15 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
     def get_pool(self, volume):
         """Returns the pool name of a volume."""
         return self.cli.get_pool(volume)
+
+    def update_consistencygroup(self, context, group,
+                                add_volumes,
+                                remove_volumes):
+        """Updates LUNs in consistency group."""
+        return self.cli.update_consistencygroup(context, group,
+                                                add_volumes,
+                                                remove_volumes)
+
+    def unmanage(self, volume):
+        """Unmanages a volume."""
+        return self.cli.unmanage(volume)
