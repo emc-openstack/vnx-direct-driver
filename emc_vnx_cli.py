@@ -44,7 +44,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.05'
+VERSION = '03.00.06'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -581,7 +581,8 @@ class CommandLineHelper(object):
                 'raw_output': ''}
 
         command_get_storage_group = ('storagegroup', '-list',
-                                     '-gname', name)
+                                     '-gname', name, '-host',
+                                     '-iscsiAttributes')
         out, rc = self.command_execute(*command_get_storage_group,
                                        poll=poll)
         if rc != 0:
@@ -1059,14 +1060,14 @@ class CommandLineHelper(object):
 
     def get_registered_spport_set(self, initiator_iqn, sgname, sg_raw_out):
         spport_set = set()
-        for m_spport in re.finditer(r'\n\s+%s\s+SP\s(A|B)\s+(\d+)' %
-                                    initiator_iqn,
-                                    sg_raw_out,
-                                    flags=re.IGNORECASE):
-            spport_set.add((m_spport.group(1), int(m_spport.group(2))))
-            LOG.debug(_('See path %(path)s in %(sg)s')
-                      % ({'path': m_spport.group(0),
-                          'sg': sgname}))
+        for m_spport in re.finditer(
+                r'\n\s+%s\s+SP\s.*\n.*\n\s*SPPort:\s+(A|B)-(\d+)v(\d+)\s*\n'
+                % initiator_iqn, sg_raw_out, flags=re.IGNORECASE):
+            spport_set.add((m_spport.group(1), int(m_spport.group(2)),
+                           int(m_spport.group(3))))
+        LOG.debug('See path %(path)s in %(sg)s.',
+                  {'path': spport_set,
+                   'sg': sgname})
         return spport_set
 
     def ping_node(self, target_portal, initiator_ip):
@@ -1105,10 +1106,12 @@ class CommandLineHelper(object):
             target_portals = list(all_iscsi_targets[target_sp])
             random.shuffle(target_portals)
             for target_portal in target_portals:
-                spport = (target_portal['SP'], target_portal['Port ID'])
+                spport = (target_portal['SP'],
+                          target_portal['Port ID'],
+                          target_portal['Virtual Port ID'])
                 if spport not in registered_spport_set:
                     LOG.debug(_("Skip SP Port %(port)s since "
-                                "no path from %(host)s is through it")
+                                "no path from %(host)s is through it.")
                               % {'port': spport,
                                  'host': hostname})
                     continue
@@ -1248,8 +1251,6 @@ class EMCVnxCliBase(object):
         self.itor_auto_reg = self.configuration.initiator_auto_registration
         self.multi_portals = self.configuration.use_multi_iscsi_portals
         self.max_retries = 5
-        self.io_ports = self._parse_ports(self.configuration.io_port_list,
-                                          self.protocol)
         self.attach_detach_batch_interval = \
             self.configuration.attach_detach_batch_interval
         if self.destroy_empty_sg:
@@ -1259,6 +1260,8 @@ class EMCVnxCliBase(object):
         self.hlu_set = set(xrange(1, self.max_luns_per_sg + 1))
         self._client = CommandLineHelper(self.configuration)
         self.array_serial = None
+        self.io_ports = self._parse_ports(self.configuration.io_port_list,
+                                          self.protocol)
         if self.protocol == 'iSCSI':
             self.iscsi_targets = self._client.get_iscsi_targets(
                 poll=True, io_ports=self.io_ports)
@@ -1628,15 +1631,15 @@ class EMCVnxCliBase(object):
                               ip, host, vport_id=None):
         gname = host
         if vport_id is not None:
-            cmd_iscsi_setpath = ('storagegroup', '-gname', gname,
-                                 '-setpath', '-hbauid', initiator_uid,
+            cmd_iscsi_setpath = ('storagegroup', '-setpath', '-gname', gname,
+                                 '-hbauid', initiator_uid,
                                  '-sp', sp, '-spport', port_id, '-spvport',
                                  vport_id, '-ip', ip, '-host', host, '-o')
             out, rc = self._client.command_execute(*cmd_iscsi_setpath)
             if rc != 0:
                 raise EMCVnxCLICmdError(cmd_iscsi_setpath, rc, out)
         else:
-            cmd_fc_setpath = ('storagegroup', '-gname', gname, '-setpath',
+            cmd_fc_setpath = ('storagegroup', '-setpath', '-gname', gname,
                               '-hbauid', initiator_uid, '-sp', sp,
                               '-spport', port_id,
                               '-ip', ip, '-host', host, '-o')
@@ -1658,10 +1661,13 @@ class EMCVnxCliBase(object):
                 # Normalize io_ports
                 for sp in ('A', 'B'):
                     for port in self.iscsi_targets[sp]:
-                        if(port['SP'], port['Port ID']) not in sp_ports:
-                            new_white[sp].append({'SP': port['SP'],
-                                                  'Port ID': port['Port ID'],
-                                                  'Virtual Port ID': 0})
+                        if((port['SP'], port['Port ID'],
+                            port['Virtual Port ID'])
+                                not in sp_ports):
+                            new_white[sp].append(
+                                {'SP': port['SP'],
+                                 'Port ID': port['Port ID'],
+                                 'Virtual Port ID': port['Virtual Port ID']})
             else:
                 new_white = self.iscsi_targets
             self._register_iscsi_initiator(ip, host, [initiator], new_white)
