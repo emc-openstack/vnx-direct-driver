@@ -1192,7 +1192,6 @@ class EMCVNXCLIToggleSPTestData():
 
 class EMCVNXCLIToggleSPTestCase(test.TestCase):
     def setUp(self):
-        #backup
         super(EMCVNXCLIToggleSPTestCase, self).setUp()
         self.stubs.Set(os.path, 'exists', mock.Mock(return_value=1))
         self.configuration = mock.Mock(conf.Configuration)
@@ -1207,31 +1206,25 @@ class EMCVNXCLIToggleSPTestCase(test.TestCase):
         self.configuration.destroy_empty_storage_group = 10
         self.configuration.storage_vnx_authentication_type = "global"
         self.configuration.iscsi_initiators = '{"fakehost": ["10.0.0.2"]}'
-        self.configuration.storage_vnx_security_file_dir = None
+        self.configuration.zoning_mode = None
+        self.configuration.storage_vnx_security_file_dir = ""
         self.cli_client = emc_vnx_cli.CommandLineHelper(
             configuration=self.configuration)
         self.test_data = EMCVNXCLIToggleSPTestData()
-
-    def tearDown(self):
-        #recover
-        super(EMCVNXCLIToggleSPTestCase, self).tearDown()
 
     def test_no_sp_toggle(self):
         self.cli_client.active_storage_ip = '10.10.10.10'
         FAKE_SUCCESS_RETURN = ('success', 0)
         FAKE_COMMAND = ('list', 'pool')
-        SIDE_EFFECTS = [FAKE_SUCCESS_RETURN, FAKE_SUCCESS_RETURN]
+        SIDE_EFFECTS = [FAKE_SUCCESS_RETURN]
 
         with mock.patch('cinder.utils.execute') as mock_utils:
             mock_utils.side_effect = SIDE_EFFECTS
             self.cli_client.command_execute(*FAKE_COMMAND)
-            self.assertEqual(self.cli_client.active_storage_ip, "10.10.10.10")
-            expected = [mock.call(*('ping', '-c', 1, '10.10.10.10'),
-                                  check_exit_code=True),
-                        mock.call(
-                            *(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.10')
-                              + FAKE_COMMAND),
-                            check_exit_code=True)]
+            self.assertEqual("10.10.10.10", self.cli_client.active_storage_ip)
+            expected = [
+                mock.call(*(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.10')
+                          + FAKE_COMMAND), check_exit_code=True)]
             mock_utils.assert_has_calls(expected)
 
     def test_toggle_sp_with_server_unavailabe(self):
@@ -1241,15 +1234,14 @@ Error occurred during HTTP request/response from the target: '10.244.213.142'.
 Message : HTTP/1.1 503 Service Unavailable"""
         FAKE_SUCCESS_RETURN = ('success', 0)
         FAKE_COMMAND = ('list', 'pool')
-        SIDE_EFFECTS = [FAKE_SUCCESS_RETURN,
-                        processutils.ProcessExecutionError(
-                            exit_code=255, stdout=FAKE_ERROR_MSG),
-                        FAKE_SUCCESS_RETURN]
+        SIDE_EFFECTS = [processutils.ProcessExecutionError(
+            exit_code=255, stdout=FAKE_ERROR_MSG),
+            FAKE_SUCCESS_RETURN]
 
         with mock.patch('cinder.utils.execute') as mock_utils:
             mock_utils.side_effect = SIDE_EFFECTS
             self.cli_client.command_execute(*FAKE_COMMAND)
-            self.assertEqual(self.cli_client.active_storage_ip, "10.10.10.11")
+            self.assertEqual("10.10.10.11", self.cli_client.active_storage_ip)
             expected = [
                 mock.call(
                     *(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.10')
@@ -1268,15 +1260,14 @@ Error occurred during HTTP request/response from the target: '10.244.213.142'.
 Message : End of data stream"""
         FAKE_SUCCESS_RETURN = ('success', 0)
         FAKE_COMMAND = ('list', 'pool')
-        SIDE_EFFECTS = [FAKE_SUCCESS_RETURN,
-                        processutils.ProcessExecutionError(
-                            exit_code=255, stdout=FAKE_ERROR_MSG),
-                        FAKE_SUCCESS_RETURN]
+        SIDE_EFFECTS = [processutils.ProcessExecutionError(
+            exit_code=255, stdout=FAKE_ERROR_MSG),
+            FAKE_SUCCESS_RETURN]
 
         with mock.patch('cinder.utils.execute') as mock_utils:
             mock_utils.side_effect = SIDE_EFFECTS
             self.cli_client.command_execute(*FAKE_COMMAND)
-            self.assertEqual(self.cli_client.active_storage_ip, "10.10.10.11")
+            self.assertEqual("10.10.10.11", self.cli_client.active_storage_ip)
             expected = [
                 mock.call(
                     *(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.10')
@@ -1297,15 +1288,40 @@ Unable to establish a secure connection to the Management Server.
 """
         FAKE_SUCCESS_RETURN = ('success', 0)
         FAKE_COMMAND = ('list', 'pool')
-        SIDE_EFFECTS = [FAKE_SUCCESS_RETURN,
-                        processutils.ProcessExecutionError(
-                            exit_code=255, stdout=FAKE_ERROR_MSG),
-                        FAKE_SUCCESS_RETURN]
+        SIDE_EFFECTS = [processutils.ProcessExecutionError(
+            exit_code=255, stdout=FAKE_ERROR_MSG),
+            FAKE_SUCCESS_RETURN]
 
         with mock.patch('cinder.utils.execute') as mock_utils:
             mock_utils.side_effect = SIDE_EFFECTS
             self.cli_client.command_execute(*FAKE_COMMAND)
-            self.assertEqual(self.cli_client.active_storage_ip, "10.10.10.11")
+            self.assertEqual("10.10.10.11", self.cli_client.active_storage_ip)
+            expected = [
+                mock.call(
+                    *(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.10')
+                        + FAKE_COMMAND),
+                    check_exit_code=True),
+                mock.call(
+                    *(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.11')
+                        + FAKE_COMMAND),
+                    check_exit_code=True)]
+            mock_utils.assert_has_calls(expected)
+
+    def test_toggle_sp_with_connection_error(self):
+        self.cli_client.active_storage_ip = '10.10.10.10'
+        FAKE_ERROR_MSG = """\
+A network error occurred while trying to connect: '192.168.1.56'.
+Message : Error occurred because of time out"""
+        FAKE_SUCCESS_RETURN = ('success', 0)
+        FAKE_COMMAND = ('list', 'pool')
+        SIDE_EFFECTS = [processutils.ProcessExecutionError(
+            exit_code=255, stdout=FAKE_ERROR_MSG),
+            FAKE_SUCCESS_RETURN]
+
+        with mock.patch('cinder.utils.execute') as mock_utils:
+            mock_utils.side_effect = SIDE_EFFECTS
+            self.cli_client.command_execute(*FAKE_COMMAND)
+            self.assertEqual("10.10.10.11", self.cli_client.active_storage_ip)
             expected = [
                 mock.call(
                     *(self.test_data.FAKE_COMMAND_PREFIX('10.10.10.10')

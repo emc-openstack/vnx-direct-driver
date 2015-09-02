@@ -44,7 +44,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.06'
+VERSION = '03.00.07'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -1129,43 +1129,33 @@ class CommandLineHelper(object):
     def _is_sp_unavailable_error(self, out):
         error_pattern = '(^Error.*Message.*End of data stream.*)|'\
                         '(.*Message.*connection refused.*)|'\
-                        '(^Error.*Message.*Service Unavailable.*)'
+                        '(^Error.*Message.*Service Unavailable.*)|'\
+                        '(^A network error occurred while trying to'\
+                        ' connect.* )|'\
+                        '(^Exception: Error occurred because of time out\s*)'
         pattern = re.compile(error_pattern)
         return pattern.match(out)
 
     def command_execute(self, *command, **kwargv):
-        """Execute command on the VNX array, when there is
-        named parameter poll=False, the command will be sent
-        alone with np option
+        """Executes command against the VNX array.
+
+        When there is named parameter poll=False, the command will be sent
+        alone with option -np.
         """
         # NOTE: retry_disable need to be removed from kwargv
         # before it pass to utils.execute, otherwise exception will thrown
         retry_disable = kwargv.pop('retry_disable', False)
-        # TODO(Tina): Do not do the SP alive check every time
-        if self._is_sp_alive(self.active_storage_ip):
-            out, rc = self._command_execute_on_active_ip(*command, **kwargv)
-            if not retry_disable and self._is_sp_unavailable_error(out):
-                # When active sp is unavailble, swith to another sp
-                # and set it to active and force a poll
-                if self._toggle_sp():
-                    LOG.debug('EMC: Command Exception: %(rc) %(result)s. '
-                              'Retry on another SP.' % {'rc': rc,
-                                                        'result': out})
-                    kwargv['poll'] = True
-                    out, rc = self._command_execute_on_active_ip(*command,
-                                                                 **kwargv)
-        elif self._toggle_sp():
-            # If active ip is not accessible, toggled to another sp
-            kwargv['poll'] = True
-            out, rc = self._command_execute_on_active_ip(*command, **kwargv)
-        else:
-            # Active IP is inaccessible, and cannot toggle to another SP,
-            # return Error
-            out, rc = "Server Unavailable", 255
-            LOG.debug('EMC: Command: %(command)s. Result: '
-                      'Server Unavailable. Command is not executed '
-                      'because SPs are inaccessible.' %
-                      {'command': self.command + command})
+        out, rc = self._command_execute_on_active_ip(*command, **kwargv)
+        if not retry_disable and self._is_sp_unavailable_error(out):
+            # When active sp is unavailable, switch to another sp
+            # and set it to active and force a poll
+            if self._toggle_sp():
+                LOG.debug('EMC: Command Exception: %(rc)s %(result)s. '
+                          'Retry on another SP.', {'rc': rc,
+                                                   'result': out})
+                kwargv['poll'] = True
+                out, rc = self._command_execute_on_active_ip(*command,
+                                                             **kwargv)
 
         return out, rc
 
@@ -1191,29 +1181,15 @@ class CommandLineHelper(object):
             out = pe.stdout
             out = out.replace('\n', '\\n')
 
-        LOG.debug('EMC: Command: %(command)s. Result: %(result)s.'
-                  % {'command': self.command + active_ip + command,
-                     'result': out.replace('\n', '\\n')})
+        LOG.debug('EMC: Command: %(command)s. Result: %(result)s.',
+                  {'command': self.command + active_ip + command,
+                   'result': out.replace('\n', '\\n')})
 
         return out, rc
 
-    def _is_sp_alive(self, ipaddr):
-        ping_cmd = ('ping', '-c', 1, ipaddr)
-        try:
-            out, err = utils.execute(*ping_cmd,
-                                     check_exit_code=True)
-        except processutils.ProcessExecutionError as pe:
-            out = pe.stdout
-            rc = pe.exit_code
-            if rc != 0:
-                LOG.debug('%s is unavaialbe' % ipaddr)
-                return False
-        LOG.debug('Ping SP %(spip)s Command Result: %(result)s.' %
-                  {'spip': self.active_storage_ip, 'result': out})
-        return True
-
     def _toggle_sp(self):
-        """This function toggles the storage IP
+        """Toggle the storage IP.
+
         Address between primary IP and secondary IP, if no SP IP address has
         exchanged, return False, otherwise True will be returned.
         """
@@ -1224,8 +1200,8 @@ class CommandLineHelper(object):
             self.active_storage_ip == self.primary_storage_ip else\
             self.primary_storage_ip
 
-        LOG.info(_('Toggle storage_vnx_ip_adress from %(old)s to '
-                   '%(new)s.') %
+        LOG.info(_('Toggle storage_vnx_ip_address from %(old)s to '
+                   '%(new)s.'),
                  {'old': old_ip,
                   'new': self.active_storage_ip})
         return True
