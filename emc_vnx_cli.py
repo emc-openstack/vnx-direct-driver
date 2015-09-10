@@ -987,7 +987,8 @@ class CommandLineHelper(object):
                 'raw_output': ''}
 
         command_get_storage_group = ('storagegroup', '-list',
-                                     '-gname', name)
+                                     '-gname', name, '-host',
+                                     '-iscsiAttributes')
 
         out, rc = self.command_execute(*command_get_storage_group,
                                        poll=poll)
@@ -1456,14 +1457,14 @@ class CommandLineHelper(object):
 
     def get_registered_spport_set(self, initiator_iqn, sgname, sg_raw_out):
         spport_set = set()
-        for m_spport in re.finditer(r'\n\s+%s\s+SP\s(A|B)\s+(\d+)' %
-                                    initiator_iqn,
-                                    sg_raw_out,
-                                    flags=re.IGNORECASE):
-            spport_set.add((m_spport.group(1), int(m_spport.group(2))))
-            LOG.debug('See path %(path)s in %(sg)s',
-                      {'path': m_spport.group(0),
-                       'sg': sgname})
+        for m_spport in re.finditer(
+                r'\n\s+%s\s+SP\s.*\n.*\n\s*SPPort:\s+(A|B)-(\d+)v(\d+)\s*\n'
+                % initiator_iqn, sg_raw_out, flags=re.IGNORECASE):
+            spport_set.add((m_spport.group(1), int(m_spport.group(2)),
+                           int(m_spport.group(3))))
+        LOG.debug('See path %(path)s in %(sg)s',
+                  {'path': spport_set,
+                   'sg': sgname})
         return spport_set
 
     def ping_node(self, target_portal, initiator_ip):
@@ -1505,7 +1506,9 @@ class CommandLineHelper(object):
             for target_sp in target_sps:
                 sp_portals = all_iscsi_targets[target_sp]
                 for portal in sp_portals:
-                    spport = (portal['SP'], portal['Port ID'])
+                    spport = (portal['SP'],
+                              portal['Port ID'],
+                              portal['Virtual Port ID'])
                     if spport not in registered_spport_set:
                         LOG.debug("Skip SP Port %(port)s since "
                                   "no path from %(host)s is through it",
@@ -1519,7 +1522,9 @@ class CommandLineHelper(object):
             target_portals = list(all_iscsi_targets[target_sp])
             random.shuffle(target_portals)
             for target_portal in target_portals:
-                spport = (target_portal['SP'], target_portal['Port ID'])
+                spport = (target_portal['SP'],
+                          target_portal['Port ID'],
+                          target_portal['Virtual Port ID'])
                 if spport not in registered_spport_set:
                     LOG.debug("Skip SP Port %(port)s since "
                               "no path from %(host)s is through it",
@@ -1696,7 +1701,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '05.04.00'
+    VERSION = '05.04.01'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
@@ -1784,14 +1789,16 @@ class EMCVnxCliBase(object):
             raise exception.VolumeBackendAPIException(data=msg)
         return valid_ports
 
-    def _validate_iscsi_port(self, sp, port_id, vlan_id, cmd_output):
-        """Validates whether the iSCSI port is existed on VNX"""
-        iscsi_pattern = ('SP:\s+' + sp.upper() +
-                         '\nPort ID:\s+' + str(port_id) +
-                         '\nPort WWN:\s+.*' +
-                         '\niSCSI Alias:\s+.*\n'
-                         '\nVirtual Port ID:\s+' + str(vlan_id))
-        return re.search(iscsi_pattern, cmd_output)
+    def _validate_iscsi_port(self, sp, port_id, vport_id, cmd_output):
+        """Validates whether the iSCSI port is existed on VNX."""
+        sp_port_pattern = (r'SP:\s+%(sp)s\nPort ID:\s+%(port_id)s' %
+                           {'sp': sp.upper(), 'port_id': port_id})
+        sp_port_fields = re.split(sp_port_pattern, cmd_output)
+        if len(sp_port_fields) < 2:
+            return False
+        sp_port_info = re.split('SP:\s+(A|B)', sp_port_fields[1])[0]
+        vport_pattern = '\nVirtual Port ID:\s+%s\nVLAN ID:' % vport_id
+        return re.search(vport_pattern, sp_port_info) is not None
 
     def _validate_fc_port(self, sp, port_id, cmd_output):
         """Validates whether the FC port is existed on VNX"""
@@ -2592,13 +2599,13 @@ class EMCVnxCliBase(object):
                               ip, host, vport_id=None):
         gname = host
         if vport_id is not None:
-            cmd_iscsi_setpath = ('storagegroup', '-gname', gname, '-setpath',
+            cmd_iscsi_setpath = ('storagegroup', '-setpath', '-gname', gname,
                                  '-hbauid', initiator_uid, '-sp', sp,
                                  '-spport', port_id, '-spvport', vport_id,
                                  '-ip', ip, '-host', host, '-o')
             out, rc = self._client.command_execute(*cmd_iscsi_setpath)
         else:
-            cmd_fc_setpath = ('storagegroup', '-gname', gname, '-setpath',
+            cmd_fc_setpath = ('storagegroup', '-setpath', '-gname', gname,
                               '-hbauid', initiator_uid, '-sp', sp,
                               '-spport', port_id,
                               '-ip', ip, '-host', host, '-o')
@@ -2625,7 +2632,9 @@ class EMCVnxCliBase(object):
                 # Normalize io_ports
                 for sp in ('A', 'B'):
                     new_ports = filter(
-                        lambda pt: (pt['SP'], pt['Port ID']) not in sp_ports,
+                        lambda pt: (pt['SP'], pt['Port ID'],
+                                    pt['Virtual Port ID'])
+                        not in sp_ports,
                         self.iscsi_targets[sp])
                     new_white[sp] = map(lambda white:
                                         {'SP': white['SP'],
