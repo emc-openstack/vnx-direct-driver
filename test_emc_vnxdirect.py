@@ -164,7 +164,7 @@ class EMCVNXCLIDriverTestData():
 
     def LUN_PROPERTY_ALL_CMD(self, lunname):
         return ('lun', '-list', '-name', lunname,
-                '-state', '-userCap', '-owner',
+                '-state', '-opDetails', '-userCap', '-owner',
                 '-attachedSnapshot')
 
     def MIGRATION_CMD(self, src_id=1, dest_id=1):
@@ -298,25 +298,37 @@ IP Address:  192.168.4.53
                 "20:11:50:EB:1A:03:3F:59\n" +
                 "SP Source ID:        69888\n", 0)
 
-    def LUN_PROPERTY(self, name, isThin=False, hasSnap=False, size=1):
-        return """\
+    def LUN_PROPERTY(self, name, is_thin=False, has_snap=False, size=1,
+                     state='Ready', faulted='false', operation='None'):
+        return ("""
                LOGICAL UNIT NUMBER 1
-               Name:  %s
+               Name:  %(name)s
                UID:  60:06:01:60:09:20:32:00:13:DF:B4:EF:C2:63:E3:11
                Current Owner:  SP A
                Default Owner:  SP A
                Allocation Owner:  SP A
-               Attached Snapshot: %s
+               Attached Snapshot: %(has_snap)s
                User Capacity (Blocks):  2101346304
-               User Capacity (GBs):  %d
+               User Capacity (GBs):  %(size)d
                Consumed Capacity (Blocks):  2149576704
                Consumed Capacity (GBs):  1024.998
-               Pool Name:  Pool_02_SASFLASH
-               Current State:  Ready
-               Is Thin LUN:  %s""" % (name,
-                                      'FakeSnap' if hasSnap else 'N/A',
-                                      size,
-                                      'Yes' if isThin else 'No'), 0
+               Pool Name:  unit_test_pool
+               Current State:  %(state)s
+               Status:  OK(0x0)
+               Is Faulted:  %(faulted)s
+               Is Transitioning:  false
+               Current Operation:  %(operation)s
+               Current Operation State:  N/A
+               Current Operation Status:  N/A
+               Current Operation Percent Completed:  0
+               Is Thin LUN:  %(is_thin)s""" % {
+            'name': name,
+            'has_snap': 'FakeSnap' if has_snap else 'N/A',
+            'size': size,
+            'state': state,
+            'faulted': faulted,
+            'operation': operation,
+            'is_thin': 'Yes' if is_thin else 'No'}, 0)
 
     def STORAGE_GROUP_NO_MAP(self, sgname):
         return ("""\
@@ -878,6 +890,53 @@ Time Remaining:  0 second(s)
         expect_cmd = [mock.call(*self.testData.LUN_CREATE_CMD('failed_vol1'),
                                 poll=False)]
         fake_cli.assert_has_calls(expect_cmd)
+
+    def test_create_faulted_volume(self):
+        volume_name = 'faulted_volume'
+        cmd_create = self.testData.LUN_CREATE_CMD(
+            volume_name, False)
+        cmd_list_preparing = self.testData.LUN_PROPERTY_ALL_CMD(volume_name)
+        commands = [cmd_create, cmd_list_preparing]
+        results = [SUCCEED,
+                   [self.testData.LUN_PROPERTY(name=volume_name,
+                                               state='Faulted',
+                                               faulted='true',
+                                               operation='Preparing'),
+                    self.testData.LUN_PROPERTY(name=volume_name,
+                                               state='Faulted',
+                                               faulted='true',
+                                               operation='None')]]
+        fake_cli = self.driverSetup(commands, results)
+        faulted_volume = self.testData.test_volume.copy()
+        faulted_volume.update({'name': volume_name})
+        self.driver.create_volume(faulted_volume)
+        expect_cmd = [
+            mock.call(*self.testData.LUN_CREATE_CMD(
+                volume_name, False), poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(volume_name),
+                      poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(volume_name),
+                      poll=False)]
+        fake_cli.assert_has_calls(expect_cmd)
+
+    def test_create_offline_volume(self):
+        volume_name = 'offline_volume'
+        cmd_create = self.testData.LUN_CREATE_CMD(
+            volume_name, False)
+        cmd_list = self.testData.LUN_PROPERTY_ALL_CMD(volume_name)
+        commands = [cmd_create, cmd_list]
+        results = [SUCCEED,
+                   self.testData.LUN_PROPERTY(name=volume_name,
+                                              state='Offline',
+                                              faulted='true')]
+        self.driverSetup(commands, results)
+        offline_volume = self.testData.test_volume.copy()
+        offline_volume.update({'name': volume_name})
+        self.assertRaisesRegexp(exception.VolumeBackendAPIException,
+                                "Volume %s was created in VNX, but in"
+                                " Offline state." % volume_name,
+                                self.driver.create_volume,
+                                offline_volume)
 
     def test_create_volume_snapshot_failed(self):
         commands = [self.testData.SNAP_CREATE_CMD('failed_snapshot')]
@@ -2208,8 +2267,8 @@ class SingleAttachDetachISCSITestCase(DriverTestCaseBase):
                     mock.call('storagegroup', '-addhlu', '-hlu', 2, '-alu', 1,
                               '-gname', 'fakehost', poll=False),
                     mock.call('lun', '-list', '-name', 'vol1', '-state',
-                              '-userCap', '-owner', '-attachedSnapshot',
-                              poll=False),
+                              '-opDetails', '-userCap', '-owner',
+                              '-attachedSnapshot', poll=False),
                     mock.call(*self.testData.PINGNODE_CMD('A', 4, 0,
                                                           '10.0.0.2'))]
         fake_cli.assert_has_calls(expected)

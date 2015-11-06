@@ -44,7 +44,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.07'
+VERSION = '03.00.08'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -175,6 +175,9 @@ class CommandLineHelper(object):
     LUN_STATE = PropertyDescriptor('-state',
                                    'Current State:\s*(.*)\s*',
                                    'state')
+    LUN_OPERATION = PropertyDescriptor('-opDetails',
+                                       'Current Operation:\s*(.*)\s*',
+                                       'operation')
     LUN_CAPACITY = PropertyDescriptor('-userCap',
                                       'User Capacity \(GBs\):\s*(.*)\s*',
                                       'total_capacity_gb',
@@ -196,7 +199,8 @@ class CommandLineHelper(object):
                                   'Pool Name:\s*(.*)\s*',
                                   'pool')
 
-    LUN_ALL = [LUN_STATE, LUN_CAPACITY, LUN_OWNER, LUN_ATTACHEDSNAP]
+    LUN_ALL = [LUN_STATE, LUN_OPERATION, LUN_CAPACITY,
+               LUN_OWNER, LUN_ATTACHEDSNAP]
 
     POOL_TOTAL_CAPACITY = PropertyDescriptor(
         '-userCap',
@@ -311,23 +315,26 @@ class CommandLineHelper(object):
             else:
                 raise EMCVnxCLICmdError(command_delete_lun, rc, out)
 
-    def _wait_for_a_condition(self, testmethod, start_time, timeout=None):
+    def _wait_for_a_condition(self, testmethod, start_time, timeout=None,
+                              ignorable_exception_arbiter=lambda ex: True):
         if timeout is None:
             timeout = self.timeout
         try:
-            testValue = testmethod()
+            test_value = testmethod()
         except Exception as ex:
-            testValue = False
-            LOG.debug(_('CommandLineHelper.'
-                        '_wait_for_condition: %(method_name)s '
-                        'execution failed for %(exception)s')
-                      % {'method_name': testmethod.__name__,
-                         'exception': ex})
-        if testValue:
+            test_value = False
+            with excutils.save_and_reraise_exception() as ctxt:
+                ctxt.reraise = not ignorable_exception_arbiter(ex)
+                LOG.debug(_('CommandLineHelper.'
+                            '_wait_for_condition: %(method_name)s '
+                            'execution failed for %(exception)s')
+                          % {'method_name': testmethod.__name__,
+                             'exception': ex})
+        if test_value:
             raise loopingcall.LoopingCallDone()
 
         if int(time.time()) - start_time > timeout:
-            msg = (_('CommandLineHelper._wait_for_condition: %s '
+            msg = (_('CommandLineHelper._wait_for_a_condition: %s '
                      'timeout') % testmethod.__name__)
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
@@ -339,16 +346,34 @@ class CommandLineHelper(object):
         def lun_is_ready():
             try:
                 data = self.get_lun_by_name(name, poll=False)
-                return data[self.LUN_STATE.key] == 'Ready'
             except EMCVnxCLICmdError as ex:
                 if ex.out.find('The (pool lun) may not exist') >= 0:
                     return False
                 else:
                     raise ex
+            return _lun_state_validation(data)
+
+        def _lun_state_validation(lun_data):
+            lun_state = lun_data[self.LUN_STATE.key]
+            if lun_state == 'Initializing':
+                return False
+            # Lun in Ready or Faulted state is eligible for IO access,
+            # so if no lun operation, return success.
+            elif lun_state in ['Ready', 'Faulted']:
+                return lun_data[self.LUN_OPERATION.key] == 'None'
+            # Raise exception if lun state is Offline, Invalid, Destroying
+            # or other unexpected states.
+            else:
+                msg = _("Volume %(lun_name)s was created in VNX, but in"
+                        " %(lun_state)s state."
+                        ) % {'lun_name': lun_data[self.LUN_NAME.key],
+                             'lun_state': lun_state}
+                raise exception.VolumeBackendAPIException(data=msg)
 
         timer = loopingcall.FixedIntervalLoopingCall(
             self._wait_for_a_condition,
-            lun_is_ready, int(time.time()))
+            lun_is_ready, int(time.time()), None,
+            lambda ex: isinstance(ex, EMCVnxCLICmdError))
         timer.start(interval=INTERVAL_5_SEC).wait()
 
     def expand_lun(self, name, new_size):
