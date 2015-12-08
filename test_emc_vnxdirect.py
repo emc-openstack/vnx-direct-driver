@@ -863,6 +863,49 @@ Time Remaining:  0 second(s)
                                 retry_disable=True)]
         fake_cli.assert_has_calls(expect_cmd)
 
+    @mock.patch("cinder.volume.drivers.emc.emc_vnx_cli."
+                "CommandLineHelper.create_lun_and_wait",
+                mock.Mock(
+                    return_value=True))
+    @mock.patch(
+        "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase."
+        "get_lun_id_by_name",
+        mock.Mock(
+            return_value=1))
+    @mock.patch(
+        "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase.get_lun_id",
+        mock.Mock(
+            return_value=1))
+    @mock.patch(
+        "cinder.volume.drivers.emc.emc_vnx_cli.CommandLineHelper."
+        "get_array_serial",
+        mock.Mock(return_value={'array_serial':
+                                "fakeSerial"}))
+    @mock.patch('time.sleep')
+    def test_volume_migration_failed_retry(self, sleep_mock):
+        commands = [self.testData.MIGRATION_CMD(),
+                    self.testData.MIGRATION_VERIFY_CMD(1)]
+        error_msg = ('Error: migrate -start command failed.\n' +
+                     'The destination LUN is not available for migration.\n')
+        results = [[(error_msg, 7), (error_msg, 7), SUCCEED],
+                   ('The specified source LUN is not currently migrating', 23)]
+        fake_cli = self.driverSetup(commands, results)
+
+        fakehost = {'capabilities': {'location_info':
+                                     "unit_test_pool2|fakeSerial",
+                                     'storage_protocol': 'iSCSI'}}
+        ret = self.driver.migrate_volume(
+            None, self.testData.test_volume, fakehost)[0]
+        self.assertTrue(ret)
+        #verification
+        expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(),
+                                retry_disable=True),
+                      mock.call(*self.testData.MIGRATION_CMD(),
+                                retry_disable=True),
+                      mock.call(*self.testData.MIGRATION_CMD(),
+                                retry_disable=True)]
+        fake_cli.assert_has_calls(expect_cmd)
+
     def test_create_destroy_volume_snapshot(self):
         fake_cli = self.driverSetup()
 
