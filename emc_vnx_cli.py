@@ -44,7 +44,7 @@ from cinder.volume import volume_types
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-VERSION = '03.00.08'
+VERSION = '03.00.09'
 
 TIMEOUT_1_MINUTE = 1 * 60
 TIMEOUT_2_MINUTE = 2 * 60
@@ -147,6 +147,28 @@ class EMCVnxCLICmdError(exception.VolumeBackendAPIException):
              'out': out.split('\n')}
         kwargs["data"] = msg
         super(EMCVnxCLICmdError, self).__init__(**kwargs)
+
+
+class EMCLunNotAvailableException(EMCVnxCLICmdError):
+    def __init__(self, *args, **kwargs):
+        super(EMCLunNotAvailableException, self).__init__(
+            *args, **kwargs)
+
+
+def retry_on_exception(expt=EMCVnxCLICmdError, max_retry=10):
+    def _decorator(f):
+        def _wrapper(*args, **kwargs):
+            i = 0
+            while i < max_retry:
+                try:
+                    return f(*args, **kwargs)
+                except expt:
+                    i += 1
+                    LOG.debug('Failed attempt %(retry)s for %(func)s',
+                              {'retry': i, 'func': f.__name__})
+                    time.sleep(30)
+        return _wrapper
+    return _decorator
 
 
 class PropertyDescriptor(object):
@@ -518,6 +540,7 @@ class CommandLineHelper(object):
             int(time.time()))
         timer.start(interval=INTERVAL_5_SEC).wait()
 
+    @retry_on_exception(EMCLunNotAvailableException)
     def migrate_lun(self, src_id, dst_id):
         command_migrate_lun = ('migrate', '-start',
                                '-source', src_id,
@@ -529,7 +552,11 @@ class CommandLineHelper(object):
                                        retry_disable=True)
 
         if 0 != rc:
-            raise EMCVnxCLICmdError(command_migrate_lun, rc, out)
+            if (rc == 7 and
+                    out.find('LUN is not available for migration') >= 0):
+                raise EMCLunNotAvailableException(command_migrate_lun, rc, out)
+            else:
+                raise EMCVnxCLICmdError(command_migrate_lun, rc, out)
         return rc
 
     def migrate_lun_with_verification(self, src_id,
