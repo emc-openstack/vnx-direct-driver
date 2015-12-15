@@ -1684,6 +1684,46 @@ Time Remaining:  0 second(s)
         "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase."
         "get_lun_id_by_name",
         mock.Mock(return_value=1))
+    @mock.patch('time.sleep')
+    def test_volume_migration_failed_retry(self, sleep_mock):
+        commands = [self.testData.MIGRATION_CMD(),
+                    self.testData.MIGRATION_VERIFY_CMD(1)]
+        error_msg = ('Error: migrate -start command failed.\n' +
+                     'The destination LUN is not available for migration.\n')
+        results = [[(error_msg, 7), (error_msg, 7), SUCCEED],
+                   ('The specified source LUN is not currently migrating', 23)]
+        fake_cli = self.driverSetup(commands, results)
+
+        fakehost = {'capabilities': {'location_info':
+                                     "unit_test_pool2|fakeSerial",
+                                     'storage_protocol': 'iSCSI'}}
+        ret = self.driver.migrate_volume(
+            None, self.testData.test_volume, fakehost)[0]
+        self.assertTrue(ret)
+        # Verification
+        expect_cmd = [mock.call(*self.testData.MIGRATION_CMD(),
+                                poll=True, retry_disable=True),
+                      mock.call(*self.testData.MIGRATION_CMD(),
+                                poll=True, retry_disable=True),
+                      mock.call(*self.testData.MIGRATION_CMD(),
+                                poll=True, retry_disable=True),
+                      mock.call(*self.testData.MIGRATION_VERIFY_CMD(1),
+                                poll=True)]
+        fake_cli.assert_has_calls(expect_cmd)
+        sleep_mock.assert_has_calls([mock.call(30), mock.call(30)])
+
+    @mock.patch("cinder.volume.drivers.emc.emc_vnx_cli."
+                "CommandLineHelper.create_lun_by_cmd",
+                mock.Mock(
+                    return_value={'lun_id': 1}))
+    @mock.patch(
+        "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase.get_lun_id",
+        mock.Mock(
+            side_effect=[1, 1]))
+    @mock.patch(
+        "cinder.volume.drivers.emc.emc_vnx_cli.EMCVnxCliBase."
+        "get_lun_id_by_name",
+        mock.Mock(return_value=1))
     def test_volume_migration_stopped(self):
 
         commands = [self.testData.MIGRATION_CMD(),

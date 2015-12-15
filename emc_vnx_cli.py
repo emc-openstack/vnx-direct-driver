@@ -165,6 +165,11 @@ def log_enter_exit(func):
     return inner
 
 
+class EMCLunNotAvailableException(exception.EMCVnxCLICmdError):
+    message = _("EMC VNX Cinder Driver LUN not available exception: %(cmd)s "
+                "(Return Code: %(rc)s) (Output: %(out)s).")
+
+
 class PropertyDescriptor(object):
     def __init__(self, option, label, key, converter=None):
         self.option = option
@@ -852,6 +857,8 @@ class CommandLineHelper(object):
 
         return rc
 
+    @utils.retry(EMCLunNotAvailableException,
+                 interval=30, retries=10, backoff_rate=1)
     def migrate_lun(self, src_id, dst_id):
         command_migrate_lun = ('migrate', '-start',
                                '-source', src_id,
@@ -864,8 +871,12 @@ class CommandLineHelper(object):
                                        poll=True)
 
         if 0 != rc:
-            self._raise_cli_error(command_migrate_lun, rc, out)
-
+            if (rc == 7 and
+                    out.find('LUN is not available for migration') >= 0):
+                raise EMCLunNotAvailableException(cmd=command_migrate_lun,
+                                                  rc=rc, out=out)
+            else:
+                self._raise_cli_error(command_migrate_lun, rc, out)
         return rc
 
     def migrate_lun_with_verification(self, src_id,
@@ -1701,7 +1712,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '05.04.01'
+    VERSION = '05.04.02'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
