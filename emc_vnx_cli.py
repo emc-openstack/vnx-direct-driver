@@ -490,7 +490,7 @@ class CommandLineHelper(object):
                                r'\s*HLU Number\s*ALU Number'
                                r'\s*[-\s]*'
                                r'(\d|\s)*'
-                               r'\s+(?P<hlu>\d+)( |\t)+%s' % lun_id)
+                               r'\s+(?P<hlu>\d+)( |\t)+%s\n' % lun_id)
         for sg_info in out.split('Storage Group Name:'):
             hlu_alu_m = hlu_alu_p.search(sg_info)
             if hlu_alu_m is None:
@@ -1711,7 +1711,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '05.04.03'
+    VERSION = '05.04.04'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
