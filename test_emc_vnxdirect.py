@@ -541,6 +541,53 @@ IP Address:  192.168.4.53
         Shareable:             YES""" % {'sgname1': sgname1,
                                          'sgname2': sgname2}, 0)
 
+    def STORAGE_GROUPS_HAS_MAP_SAME_PREFIX(self, sgname1, sgname2):
+        return ("""
+
+        Storage Group Name:    %(sgname1)s
+        Storage Group UID:     54:46:57:0F:15:A2:E3:11:9A:8D:FF:E5:3A:03:FD:6D
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:222                     SP A         4
+        Host name:             fakehost
+        SPPort:                A-4v0
+        Initiator IP:          fakeip
+        TPGT:                  3
+        ISID:                  fakeid
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            31              3
+            20              31
+            41              4
+        Shareable:             YES
+
+        Storage Group Name:    %(sgname2)s
+        Storage Group UID:     9C:86:4F:30:07:76:E4:11:AC:83:C8:C0:8E:9C:D6:1F
+        HBA/SP Pairs:
+
+          HBA UID                                          SP Name     SPPort
+          -------                                          -------     ------
+          iqn.1993-08.org.debian:01:5741c6307e60            SP A         6
+        Host name:             fakehost
+        SPPort:                A-6v0
+        Initiator IP:          fakeip
+        TPGT:                  3
+        ISID:                  fakeid
+
+        HLU/ALU Pairs:
+
+          HLU Number     ALU Number
+          ----------     ----------
+            32              32
+            42              4
+        Shareable:             YES""" % {'sgname1': sgname1,
+                                         'sgname2': sgname2}, 0)
+
     def LUN_DELETE_IN_SG_ERROR(self, up_to_date=True):
         if up_to_date:
             return ("Cannot unbind LUN "
@@ -1203,6 +1250,18 @@ Time Remaining:  0 second(s)
                         'fakehost2', '32'), poll=False),
                     mock.call(*self.testData.LUN_DELETE_CMD('vol2_in_sg'))]
         fake_cli.assert_has_calls(expected)
+
+    def test_delete_volume_in_sg_same_prefix(self):
+        commands = [self.testData.STORAGEGROUP_LIST_CMD()]
+        results = [self.testData.STORAGE_GROUPS_HAS_MAP_SAME_PREFIX(
+            'fakehost1', 'fakehost2')]
+        self.driverSetup(commands, results)
+        self.driver.cli._client.force_delete_lun_in_sg = True
+        hlus1 = self.driver.cli._client.get_hlus(4, True)
+        self.assertEqual(hlus1, [('41', 'fakehost1'), ('42', 'fakehost2')])
+
+        hlus2 = self.driver.cli._client.get_hlus(3, True)
+        self.assertEqual(hlus2, [('31', 'fakehost1')])
 
     def test_extend_volume(self):
         commands = [self.testData.LUN_PROPERTY_ALL_CMD('vol1')]
