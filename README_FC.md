@@ -87,9 +87,9 @@ The steps mentioned below are for the compute nodes. Please follow the same step
     * Login Unisphere, go to `FNM0000000000->Hosts->Initiators`,
     * Refresh and wait until initiator `20:00:00:24:FF:48:BA:C2:21:00:00:24:FF:48:BA:C2` with SP Port `A-1` appears.
     * Click the `Register` button, select `CLARiiON/VNX` and enter the host name (which is the output of the linux command `hostname`) and IP address:
-        * Hostname : myhost1
-        * IP : 10.10.61.1
-        * Click Register. 
+	    * Hostname : myhost1
+	    * IP : 10.10.61.1
+	    * Click Register. 
     * Now host 10.10.61.1 will appear under Hosts->Host List as well.
 * Register the WWN with more ports if needed.
 
@@ -275,6 +275,51 @@ OpenStack support read-only volumes. The following command can be used to set a 
 
 After a volume is marked as read-only, the driver will forward the information when a hypervisor is attaching the volume and the hypervisor will have an implementation-specific way to make sure the volume is not written.
 
+## Snap copy
+
+* Metadata Key: `snapcopy`
+* Possible Values:
+    * `True` or `true`
+    * `False` or `false`
+* Default: `False`
+
+VNX driver supports snap copy which extremely accelerates the process for
+creating a copied volume.
+
+By default, the driver will do full data copy when creating a
+volume from a snapshot or cloning a volume, which is time-consuming especially
+for large volumes.  When snap copy is used, driver will simply create a snapshot
+and mount it as a volume for the 2 kinds of operations which will be instant
+even for large volumes.
+
+To enable this functionality, user should append `--metadata snapcopy=True`
+when creating cloned volume or creating volume from snapshot. Then the newly
+created volume will be in fact a snap copy instead of a full copy.
+If a full copy is needed, retype/migration can be used to convert the
+snap-copy volume to a full-copy volume which may be time-consuming.
+
+        cinder create --source-volid <source-void> --name "cloned_volume" --metadata snapcopy=True
+
+or
+
+        cinder create --snapshot-id <snapshot-id> --name "vol_from_snapshot" --metadata snapcopy=True
+
+User can determine whether the volume is a snap-copy volume or not by
+showing its metadata. If the `snapcopy` in metadata is `True` or `true` , the volume is a
+snap-copy volume. Otherwise, it is a full-copy volume.
+
+        cinder metadata-show <volume>
+
+__Constraints:__
+
+* The number of snap-copy volume created from a single source volume is limited to
+  255 at one point in time.
+* The source volume which has snap-copy volume can not be deleted.
+* The source volume which has snap-copy volume can not be migrated.
+* snapcopy volume will be change to full-copy volume after host-assisted or storage-assisted migration.
+* snapcopy volume can not be added to consisgroup because of VNX limitation.
+
+
 ##  Volume number threshold
 
 In VNX, there is limit on the maximum number of pool volumes that can be created in the system. When the limit is reached, no more pool volumes can be created even if there is remaining capacity in the storage pool. In other words, if the scheduler dispatches a volume creation request to a back end that has free capacity but reaches the limit, the back end will fail to create the corresponding volume.
@@ -355,3 +400,4 @@ Some `available` volumes may remain in storage group on the VNX array due to som
 When `force_delete_lun_in_storagegroup=True` in the back-end section, the driver will move the volumes out of storage groups and then delete them if the user tries to delete the volumes that remain in storage group on the VNX array.
 
 The default value of `force_delete_lun_in_storagegroup` is `False`.
+

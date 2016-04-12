@@ -20,6 +20,8 @@ from oslo_concurrency import processutils
 
 from cinder import exception
 from cinder import test
+from cinder.tests import fake_snapshot
+from cinder.tests import fake_volume
 from cinder.tests import utils
 from cinder.volume import configuration as conf
 from cinder.volume.drivers.emc import emc_cli_fc
@@ -31,6 +33,26 @@ from cinder.zonemanager import fc_san_lookup_service as fc_service
 SUCCEED = ("", 0)
 FAKE_ERROR_RETURN = ("FAKE ERROR", 255)
 VERSION = emc_vnx_cli.EMCVnxCliBase.VERSION
+
+
+def build_migration_dest_name(src_name):
+    return src_name + '_dest'
+
+
+def convert_snapshot(snapshot, expected_attrs=['volume']):
+    if expected_attrs:
+        snapshot = snapshot.copy()
+        snapshot['volume'] = fake_volume.fake_volume_obj(
+            None, **snapshot['volume'])
+    snap = fake_snapshot.fake_snapshot_obj(
+        None, expected_attrs=expected_attrs, **snapshot)
+    return snap
+
+
+def convert_volume(volume):
+    vol = fake_volume.fake_volume_obj(
+        None, **volume)
+    return vol
 
 
 class EMCVNXCLIDriverTestData(object):
@@ -116,6 +138,8 @@ class EMCVNXCLIDriverTestData(object):
         'provider_auth': None,
         'host': "host@backendsec#unit_test_pool",
         'project_id': 'project',
+        'provider_location':
+            'system^FNM11111|type^lun|id^1|base_lun_name^new_test_lun',
         'display_name': 'vol2',
         'consistencygroup_id': None,
         'display_description': 'test volume',
@@ -155,6 +179,8 @@ class EMCVNXCLIDriverTestData(object):
         'id': '1',
         'provider_auth': None,
         'host': "host@backendsec#unit_test_pool",
+        'provider_location':
+            'system^FNM11111|type^lun|id^3|base_lun_name^new_lun_name',
         'project_id': 'project',
         'display_name': 'thin_vol',
         'consistencygroup_id': None,
@@ -201,7 +227,7 @@ class EMCVNXCLIDriverTestData(object):
         'provider_location': 'system^fakesn|type^lun|id^3|version^05.03.00'}
 
     test_snapshot = {
-        'name': 'snapshot1',
+        'name': 'snapshot-4444',
         'size': 1,
         'id': '4444',
         'volume_name': 'vol1',
@@ -239,6 +265,7 @@ class EMCVNXCLIDriverTestData(object):
         'host': "host@backendsec#unit_test_pool",
         'project_id': 'project',
         'display_name': 'clone1',
+        'provider_location': 'system^FNM11111|type^lun|id^1|version^05.03.00',
         'consistencygroup_id': 'consistencygroup_id',
         'display_description': 'volume created from snapshot',
         'volume_type_id': None}
@@ -464,14 +491,22 @@ class EMCVNXCLIDriverTestData(object):
     def SNAP_DELETE_CMD(self, name):
         return ('snap', '-destroy', '-id', name, '-o')
 
-    def SNAP_CREATE_CMD(self, name):
-        return ('snap', '-create', '-res', 1, '-name', name,
+    def SNAP_CREATE_CMD(self, name, res_id=1):
+        return ('snap', '-create', '-res', res_id, '-name', name,
                 '-allowReadWrite', 'yes',
                 '-allowAutoDelete', 'no')
 
     def SNAP_LIST_CMD(self, res_id=1):
         cmd = ('snap', '-list', '-res', res_id)
         return cmd
+
+    def SNAP_MODIFY_CMD(self, name, rw):
+        return ('snap', '-modify', '-id', name, '-allowReadWrite', rw,
+                '-allowAutoDelete', 'yes')
+
+    def SNAP_COPY_CMD(self, src_snap, snap_name):
+        return ('snap', '-copy', '-id', src_snap, '-name', snap_name,
+                '-ignoreMigrationCheck', '-ignoreDeduplicationCheck')
 
     def LUN_DELETE_CMD(self, name):
         return ('lun', '-destroy', '-name', name, '-forceDetach', '-o')
@@ -1189,9 +1224,9 @@ IP Address:  192.168.4.53
                 '-ip', ip, '-host', gname, '-o')
 
 
-class DriverTestCaseBase(test.TestCase):
+class TestCaseBaseDriver(test.TestCase):
     def setUp(self):
-        super(DriverTestCaseBase, self).setUp()
+        super(TestCaseBaseDriver, self).setUp()
 
         self.stubs.Set(emc_vnx_cli.CommandLineHelper, 'command_execute',
                        self.fake_command_execute_for_driver_setup)
@@ -1256,6 +1291,12 @@ class DriverTestCaseBase(test.TestCase):
     def standard_fake_command_execute(self, *args, **kwargv):
         standard_commands = [
             self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
+            self.testData.LUN_PROPERTY_ALL_CMD('volume-1'),
+            self.testData.LUN_PROPERTY_ALL_CMD('volume-2'),
+            self.testData.LUN_PROPERTY_ALL_CMD(
+                build_migration_dest_name('volume-1')),
+            self.testData.LUN_PROPERTY_ALL_CMD(
+                build_migration_dest_name('volume-2')),
             self.testData.LUN_PROPERTY_ALL_CMD('vol2'),
             self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
             self.testData.LUN_PROPERTY_ALL_CMD('vol-vol1'),
@@ -1264,6 +1305,12 @@ class DriverTestCaseBase(test.TestCase):
 
         standard_results = [
             self.testData.LUN_PROPERTY('vol1'),
+            self.testData.LUN_PROPERTY('volume-1'),
+            self.testData.LUN_PROPERTY('volume-2'),
+            self.testData.LUN_PROPERTY(
+                build_migration_dest_name('volume-1')),
+            self.testData.LUN_PROPERTY(
+                build_migration_dest_name('volume-2')),
             self.testData.LUN_PROPERTY('vol2'),
             self.testData.LUN_PROPERTY('vol2_dest'),
             self.testData.LUN_PROPERTY('vol-vol1'),
@@ -1292,7 +1339,7 @@ class DriverTestCaseBase(test.TestCase):
         return _safe_get
 
 
-class EMCVNXCLIDriverISCSITestCase(DriverTestCaseBase):
+class EMCVNXCLIISCSITestCaseDriver(TestCaseBaseDriver):
     def generateDriver(self, conf):
         return emc_cli_iscsi.EMCCLIISCSIDriver(configuration=conf)
 
@@ -1813,15 +1860,15 @@ Time Remaining:  0 second(s)
 
     def test_create_destroy_volume_snapshot(self):
         fake_cli = self.driverSetup()
-
+        snap = convert_snapshot(self.testData.test_snapshot)
         # case
-        self.driver.create_snapshot(self.testData.test_snapshot)
-        self.driver.delete_snapshot(self.testData.test_snapshot)
+        self.driver.create_snapshot(snap)
+        self.driver.delete_snapshot(snap)
 
         # verification
-        expect_cmd = [mock.call(*self.testData.SNAP_CREATE_CMD('snapshot1'),
+        expect_cmd = [mock.call(*self.testData.SNAP_CREATE_CMD(snap.name),
                                 poll=False),
-                      mock.call(*self.testData.SNAP_DELETE_CMD('snapshot1'),
+                      mock.call(*self.testData.SNAP_DELETE_CMD(snap.name),
                                 poll=True)]
 
         fake_cli.assert_has_calls(expect_cmd)
@@ -2292,10 +2339,13 @@ Time Remaining:  0 second(s)
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_volume_from_snapshot(self):
-        # set up
-        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        output_dest = self.testData.LUN_PROPERTY("vol2_dest")
+        volume2 = convert_volume(self.testData.test_volume2)
+        snapshot = convert_snapshot(self.testData.test_snapshot)
+        vol2_name = volume2.name
+        vol2_name_dest = volume2.name + '_dest'
+        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest)
+        cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest)
+        output_dest = self.testData.LUN_PROPERTY(vol2_name_dest)
         cmd_migrate = self.testData.MIGRATION_CMD(1, 1)
         output_migrate = ("", 0)
         cmd_migrate_verify = self.testData.MIGRATION_VERIFY_CMD(1)
@@ -2307,23 +2357,25 @@ Time Remaining:  0 second(s)
                    output_migrate_verify]
         fake_cli = self.driverSetup(commands, results)
 
-        self.driver.create_volume_from_snapshot(self.testData.test_volume2,
-                                                self.testData.test_snapshot)
+        self.driver.create_volume_from_snapshot(volume2,
+                                                snapshot)
         expect_cmd = [
             mock.call(
                 *self.testData.SNAP_MP_CREATE_CMD(
-                    name='vol2', source='vol1'),
+                    name=vol2_name, source=snapshot.volume.name),
                 poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name),
+                      poll=True),
             mock.call(
                 *self.testData.SNAP_ATTACH_CMD(
-                    name='vol2', snapName='snapshot1')),
+                    name=vol2_name, snapName=snapshot.name)),
             mock.call(*self.testData.LUN_CREATION_CMD(
-                'vol2_dest', 1, 'unit_test_pool', None, None)),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+                vol2_name_dest, 1, 'unit_test_pool', None, None)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name),
                       poll=True),
             mock.call(*self.testData.MIGRATION_CMD(1, 1),
                       retry_disable=True,
@@ -2332,15 +2384,53 @@ Time Remaining:  0 second(s)
                       poll=True)]
         fake_cli.assert_has_calls(expect_cmd)
 
+    @mock.patch("cinder.volume.drivers.emc.emc_vnx_cli."
+                "CommandLineHelper.create_lun_by_cmd",
+                mock.Mock(return_value={'lun_id': 1}))
+    def test_create_volume_from_snapshot_smp(self):
+        fake_cli = self.driverSetup()
+        test_snap = convert_snapshot(
+            self.testData.test_snapshot)
+        new_volume = self.testData.test_volume.copy()
+        new_volume['name_id'] = new_volume['id']
+        new_volume['volume_metadata'] = [{'key': 'snapcopy', 'value': 'True'}]
+        vol = self.driver.create_volume_from_snapshot(
+            new_volume, test_snap)
+        self.assertTrue(
+            vol['provider_location'].find('type^smp') > 0)
+        expect_cmd = [
+            mock.call(
+                *self.testData.SNAP_COPY_CMD(
+                    src_snap=test_snap.name,
+                    snap_name='snap-as-vol-%s' % test_snap.volume.id)),
+            mock.call(
+                *self.testData.SNAP_MODIFY_CMD(
+                    name='snap-as-vol-%s' % test_snap.volume.id,
+                    rw='yes')),
+            mock.call(
+                *self.testData.SNAP_MP_CREATE_CMD(
+                    name=new_volume['name'], source=test_snap.volume_name),
+                poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(new_volume['name']),
+                      poll=True),
+            mock.call(
+                *self.testData.SNAP_ATTACH_CMD(
+                    name=new_volume['name'],
+                    snapName='snap-as-vol-%s' % test_snap.volume.id))]
+        fake_cli.assert_has_calls(expect_cmd)
+
     @mock.patch('cinder.openstack.common.loopingcall.FixedIntervalLoopingCall',
                 new=utils.ZeroIntervalLoopingCall)
     def test_create_volume_from_snapshot_sync_failed(self):
-
-        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        output_dest = self.testData.LUN_PROPERTY("vol2_dest")
+        test_volume = convert_volume(self.testData.test_volume2)
+        test_snapshot = convert_snapshot(self.testData.test_snapshot)
+        vol2_name = test_volume.name
+        vol2_name_dest = test_volume.name + '_dest'
+        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest)
+        cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest)
+        output_dest = self.testData.LUN_PROPERTY(vol2_name_dest)
         cmd_migrate = self.testData.MIGRATION_CMD(1, 1)
-        cmd_detach_lun = ('lun', '-detach', '-name', 'vol2')
+        cmd_detach_lun = ('lun', '-detach', '-name', vol2_name)
         output_migrate = ("", 0)
         cmd_migrate_verify = self.testData.MIGRATION_VERIFY_CMD(1)
         output_migrate_verify = (r'The specified source LUN '
@@ -2355,26 +2445,27 @@ Time Remaining:  0 second(s)
                    output_migrate_cancel]
 
         fake_cli = self.driverSetup(commands, results)
-
         self.assertRaises(exception.VolumeBackendAPIException,
                           self.driver.create_volume_from_snapshot,
-                          self.testData.test_volume2,
-                          self.testData.test_snapshot)
+                          test_volume,
+                          test_snapshot)
         expect_cmd = [
             mock.call(
                 *self.testData.SNAP_MP_CREATE_CMD(
-                    name='vol2', source='vol1'),
+                    name=vol2_name, source=test_snapshot.volume.name),
                 poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name),
+                      poll=True),
             mock.call(
                 *self.testData.SNAP_ATTACH_CMD(
-                    name='vol2', snapName='snapshot1')),
+                    name=vol2_name, snapName=test_snapshot.name)),
             mock.call(*self.testData.LUN_CREATION_CMD(
-                'vol2_dest', 1, 'unit_test_pool', None, None)),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+                vol2_name_dest, 1, 'unit_test_pool', None, None)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name),
                       poll=True),
             mock.call(*self.testData.MIGRATION_CMD(1, 1),
                       retry_disable=True,
@@ -2384,50 +2475,58 @@ Time Remaining:  0 second(s)
             mock.call(*self.testData.MIGRATION_CANCEL_CMD(1)),
             mock.call(*self.testData.MIGRATION_VERIFY_CMD(1),
                       poll=False),
-            mock.call(*self.testData.LUN_DELETE_CMD('vol2_dest')),
+            mock.call(*self.testData.LUN_DELETE_CMD(vol2_name_dest)),
             mock.call(*cmd_detach_lun),
-            mock.call(*self.testData.LUN_DELETE_CMD('vol2'))]
+            mock.call(*self.testData.LUN_DELETE_CMD(vol2_name))]
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_vol_from_snap_failed_in_migrate_lun(self):
-        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        output_dest = self.testData.LUN_PROPERTY("vol2_dest")
+        test_volume2 = convert_volume(self.testData.test_volume2)
+        test_snapshot = convert_snapshot(self.testData.test_snapshot)
+        source_volume = test_snapshot.volume
+        vol2_name = test_volume2.name
+        vol2_name_dest = vol2_name + '_dest'
+        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest)
+        output_dest = self.testData.LUN_PROPERTY(vol2_name_dest)
         cmd_migrate = self.testData.MIGRATION_CMD(1, 1)
-        cmd_detach_lun = ('lun', '-detach', '-name', 'vol2')
+        cmd_detach_lun = ('lun', '-detach', '-name', vol2_name)
         commands = [cmd_dest, cmd_migrate]
         results = [output_dest, FAKE_ERROR_RETURN]
         fake_cli = self.driverSetup(commands, results)
 
         self.assertRaises(exception.VolumeBackendAPIException,
                           self.driver.create_volume_from_snapshot,
-                          self.testData.test_volume2,
-                          self.testData.test_snapshot)
+                          test_volume2,
+                          test_snapshot)
         expect_cmd = [
             mock.call(
                 *self.testData.SNAP_MP_CREATE_CMD(
-                    name='vol2', source='vol1'), poll=False),
+                    name=vol2_name, source=source_volume.name), poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name),
+                      poll=True),
             mock.call(
                 *self.testData.SNAP_ATTACH_CMD(
-                    name='vol2', snapName='snapshot1')),
+                    name=vol2_name, snapName=test_snapshot.name)),
             mock.call(*self.testData.LUN_CREATION_CMD(
-                'vol2_dest', 1, 'unit_test_pool', None, None)),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+                vol2_name_dest, 1, 'unit_test_pool', None, None)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2'), poll=True),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol2_name),
+                      poll=True),
             mock.call(*self.testData.MIGRATION_CMD(1, 1),
                       poll=True,
                       retry_disable=True),
-            mock.call(*self.testData.LUN_DELETE_CMD('vol2_dest')),
+            mock.call(*self.testData.LUN_DELETE_CMD(vol2_name_dest)),
             mock.call(*cmd_detach_lun),
-            mock.call(*self.testData.LUN_DELETE_CMD('vol2'))]
+            mock.call(*self.testData.LUN_DELETE_CMD(vol2_name))]
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_cloned_volume(self):
-        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol1_dest")
-        cmd_dest_p = self.testData.LUN_PROPERTY_ALL_CMD("vol1_dest")
-        output_dest = self.testData.LUN_PROPERTY("vol1_dest")
+        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("volume-1_dest")
+        cmd_dest_p = self.testData.LUN_PROPERTY_ALL_CMD("volume-1_dest")
+        output_dest = self.testData.LUN_PROPERTY("volume-1_dest")
         cmd_migrate = self.testData.MIGRATION_CMD(1, 1)
         output_migrate = ("", 0)
         cmd_migrate_verify = self.testData.MIGRATION_VERIFY_CMD(1)
@@ -2438,28 +2537,29 @@ Time Remaining:  0 second(s)
         results = [output_dest, output_dest, output_migrate,
                    output_migrate_verify]
         fake_cli = self.driverSetup(commands, results)
-
-        self.driver.create_cloned_volume(self.testData.test_volume,
-                                         self.testData.test_snapshot)
+        test_volume = convert_volume(self.testData.test_volume)
+        test_volume2 = convert_volume(self.testData.test_volume2)
+        self.driver.create_cloned_volume(test_volume,
+                                         test_volume2)
         tmp_snap = 'tmp-snap-' + self.testData.test_volume['id']
         expect_cmd = [
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('snapshot1'),
-                      poll=True),
             mock.call(
                 *self.testData.SNAP_CREATE_CMD(tmp_snap), poll=False),
             mock.call(*self.testData.SNAP_MP_CREATE_CMD(
-                name='vol1',
-                source='snapshot1'), poll=False),
+                name='volume-1',
+                source='new_test_lun'), poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('volume-1'),
+                      poll=True),
             mock.call(
                 *self.testData.SNAP_ATTACH_CMD(
-                    name='vol1', snapName=tmp_snap)),
+                    name='volume-1', snapName=tmp_snap)),
             mock.call(*self.testData.LUN_CREATION_CMD(
-                'vol1_dest', 1, 'unit_test_pool', None, None)),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1_dest'),
+                'volume-1_dest', 1, 'unit_test_pool', None, None)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('volume-1_dest'),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1_dest'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('volume-1_dest'),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('volume-1'),
                       poll=True),
             mock.call(*self.testData.MIGRATION_CMD(1, 1),
                       poll=True,
@@ -2468,6 +2568,36 @@ Time Remaining:  0 second(s)
                       poll=True),
             mock.call(*self.testData.SNAP_DELETE_CMD(tmp_snap),
                       poll=True)]
+        fake_cli.assert_has_calls(expect_cmd)
+
+    @mock.patch(
+        "cinder.volume.volume_types."
+        "get_volume_type_extra_specs",
+        mock.Mock(return_value={'provisioning:type': 'thick'}))
+    def test_create_cloned_volume_smp(self):
+        fake_cli = self.driverSetup()
+        test_clone = self.testData.test_clone.copy()
+        test_clone['volume_metadata'] = [{'key': 'snapcopy', 'value': 'True'}]
+        test_clone['name_id'] = test_clone['id']
+        vol = self.driver.create_cloned_volume(
+            test_clone,
+            self.testData.test_volume_with_type)
+        self.assertIn('type^smp', vol['provider_location'])
+        expect_cmd = [
+            mock.call(
+                *self.testData.SNAP_CREATE_CMD(
+                    name='snap-as-vol-%s' % '2', res_id=3),
+                poll=False),
+            mock.call(
+                *self.testData.SNAP_MP_CREATE_CMD(
+                    name=test_clone['name'], source='new_lun_name'),
+                poll=False),
+            mock.call(
+                *self.testData.LUN_PROPERTY_ALL_CMD(test_clone['name']),
+                poll=True),
+            mock.call(
+                *self.testData.SNAP_ATTACH_CMD(
+                    name=test_clone['name'], snapName='snap-as-vol-%s' % '2'))]
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_delete_volume_failed(self):
@@ -2549,6 +2679,19 @@ Time Remaining:  0 second(s)
 
         hlus2 = self.driver.cli._client.get_hlus(3, True)
         self.assertEqual(hlus2, [('31', 'fakehost1')])
+
+    def test_delete_volume_smp(self):
+        fake_cli = self.driverSetup()
+        vol = self.testData.test_volume_with_type.copy()
+        vol['volume_metadata'] = [{'key': 'snapcopy', 'value': 'True'}]
+        vol['provider_location'] = 'system^FNM11111|type^smp|id^1'
+        vol['name_id'] = vol['id']
+        tmp_snap = 'snap-as-vol-%s' % vol['id']
+        self.driver.delete_volume(vol)
+        expected = [mock.call(*self.testData.LUN_DELETE_CMD(vol['name'])),
+                    mock.call(*self.testData.SNAP_DELETE_CMD(tmp_snap),
+                              poll=True)]
+        fake_cli.assert_has_calls(expected)
 
     def test_extend_volume(self):
         commands = [self.testData.LUN_PROPERTY_ALL_CMD('vol1')]
@@ -3375,9 +3518,12 @@ Time Remaining:  0 second(s)
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_cloned_volume_from_consistnecy_group(self):
-        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol1_dest")
-        cmd_dest_p = self.testData.LUN_PROPERTY_ALL_CMD("vol1_dest")
-        output_dest = self.testData.LUN_PROPERTY("vol1_dest")
+        test_volume_clone_cg = convert_volume(
+            self.testData.test_volume_clone_cg)
+        test_clone_cg = convert_volume(self.testData.test_clone_cg)
+        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("volume-1_dest")
+        cmd_dest_p = self.testData.LUN_PROPERTY_ALL_CMD("volume-1_dest")
+        output_dest = self.testData.LUN_PROPERTY("volume-1_dest")
         cmd_migrate = self.testData.MIGRATION_CMD(1, 1)
         output_migrate = ("", 0)
         cmd_migrate_verify = self.testData.MIGRATION_VERIFY_CMD(1)
@@ -3391,25 +3537,30 @@ Time Remaining:  0 second(s)
                    output_migrate_verify]
         fake_cli = self.driverSetup(commands, results)
 
-        self.driver.create_cloned_volume(self.testData.test_volume_clone_cg,
-                                         self.testData.test_clone_cg)
-        tmp_cgsnapshot = 'tmp-cgsnapshot-' + self.testData.test_volume['id']
+        self.driver.create_cloned_volume(test_volume_clone_cg,
+                                         test_clone_cg)
+        tmp_cgsnapshot = 'tmp-snap-' + self.testData.test_volume['id']
         expect_cmd = [
             mock.call(
                 *self.testData.CREATE_CG_SNAPSHOT(cg_name, tmp_cgsnapshot)),
-            mock.call(*self.testData.SNAP_MP_CREATE_CMD(name='vol1',
-                                                        source='clone1'),
-                      poll=False),
+            mock.call(
+                *self.testData.SNAP_MP_CREATE_CMD(
+                    name=test_volume_clone_cg.name,
+                    source=test_clone_cg.name), poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(
+                test_volume_clone_cg.name), poll=True),
             mock.call(
                 *self.testData.SNAP_ATTACH_CMD(
-                    name='vol1', snapName=tmp_cgsnapshot)),
+                    name=test_volume_clone_cg.name, snapName=tmp_cgsnapshot)),
             mock.call(*self.testData.LUN_CREATION_CMD(
-                'vol1_dest', 1, 'unit_test_pool', None, None)),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1_dest'),
-                      poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1_dest'),
-                      poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol1'), poll=True),
+                test_volume_clone_cg.name + '_dest', 1,
+                'unit_test_pool', None, None)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(
+                test_volume_clone_cg.name + '_dest'), poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(
+                test_volume_clone_cg.name + '_dest'), poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(
+                test_volume_clone_cg.name), poll=True),
             mock.call(*self.testData.MIGRATION_CMD(1, 1),
                       retry_disable=True,
                       poll=True),
@@ -3419,9 +3570,13 @@ Time Remaining:  0 second(s)
         fake_cli.assert_has_calls(expect_cmd)
 
     def test_create_volume_from_cgsnapshot(self):
-        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD("vol2_dest")
-        output_dest = self.testData.LUN_PROPERTY("vol2_dest")
+        volume = convert_volume(self.testData.volume_in_cg)
+        snapshot_in_cg = convert_snapshot(self.testData.test_member_cgsnapshot)
+        vol_name = volume.name
+        vol_name_dest = volume.name + '_dest'
+        cmd_dest = self.testData.LUN_PROPERTY_ALL_CMD(vol_name_dest)
+        cmd_dest_np = self.testData.LUN_PROPERTY_ALL_CMD(vol_name_dest)
+        output_dest = self.testData.LUN_PROPERTY(vol_name_dest)
         cmd_migrate = self.testData.MIGRATION_CMD(1, 1)
         output_migrate = ("", 0)
         cmd_migrate_verify = self.testData.MIGRATION_VERIFY_CMD(1)
@@ -3434,22 +3589,24 @@ Time Remaining:  0 second(s)
         fake_cli = self.driverSetup(commands, results)
 
         self.driver.create_volume_from_snapshot(
-            self.testData.volume_in_cg, self.testData.test_member_cgsnapshot)
+            volume, snapshot_in_cg)
         expect_cmd = [
             mock.call(
                 *self.testData.SNAP_MP_CREATE_CMD(
-                    name='vol2', source='vol1'),
+                    name=vol_name, source=snapshot_in_cg.volume.name),
                 poll=False),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol_name),
+                      poll=True),
             mock.call(
                 *self.testData.SNAP_ATTACH_CMD(
-                    name='vol2', snapName='cgsnapshot_id')),
+                    name=vol_name, snapName=snapshot_in_cg.cgsnapshot_id)),
             mock.call(*self.testData.LUN_CREATION_CMD(
-                'vol2_dest', 1, 'unit_test_pool', None, None)),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+                vol_name_dest, 1, 'unit_test_pool', None, None)),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2_dest'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol_name_dest),
                       poll=False),
-            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD('vol2'),
+            mock.call(*self.testData.LUN_PROPERTY_ALL_CMD(vol_name),
                       poll=True),
             mock.call(*self.testData.MIGRATION_CMD(1, 1),
                       retry_disable=True,
@@ -3670,9 +3827,9 @@ Time Remaining:  0 second(s)
         self.assertEqual(expected_info, connect_info)
 
 
-class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
+class EMCVNXCLIDArrayBasedTestCaseDriver(TestCaseBaseDriver):
     def setUp(self):
-        super(EMCVNXCLIDArrayBasedDriverTestCase, self).setUp()
+        super(EMCVNXCLIDArrayBasedTestCaseDriver, self).setUp()
         self.configuration.safe_get = self.fake_safe_get(
             {'storage_vnx_pool_name': None,
              'volume_backend_name': 'namedbackend'})
@@ -3969,7 +4126,7 @@ class EMCVNXCLIDArrayBasedDriverTestCase(DriverTestCaseBase):
             'B', 7, 2, port_list))
 
 
-class EMCVNXCLIDriverFCTestCase(DriverTestCaseBase):
+class EMCVNXCLIFCTestCaseDriver(TestCaseBaseDriver):
     def generateDriver(self, conf):
         return emc_cli_fc.EMCCLIFCDriver(configuration=conf)
 
