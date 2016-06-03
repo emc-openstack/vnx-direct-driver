@@ -36,9 +36,12 @@ from taskflow.patterns import linear_flow
 from taskflow import task
 from taskflow.types import failure
 
+from cinder import context
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
 from cinder.openstack.common import loopingcall
+from cinder.openstack.common import periodic_task
+
 from cinder import utils
 from cinder.volume import configuration as config
 from cinder.volume.drivers.san import san
@@ -55,6 +58,7 @@ INTERVAL_5_SEC = 5
 INTERVAL_20_SEC = 20
 INTERVAL_30_SEC = 30
 INTERVAL_60_SEC = 60
+DEFAULT_INTERVAL = 300
 
 ENABLE_TRACE = False
 
@@ -742,6 +746,27 @@ class CommandLineHelper(object):
             else:
                 self._raise_cli_error(delete_cg_snap_cmd, rc, out)
 
+    def get_snapshots(self, snap_prefix):
+        command_list_snapshots = ('snap', '-list',
+                                  '-detail')
+        out, rc = self.command_execute(*command_list_snapshots,
+                                       poll=False)
+        if rc != 0:
+            self._raise_cli_error(command_list_snapshots, rc, out)
+        snaplist = []
+        snaps_output = out.split('\n\n')
+        for output in snaps_output:
+            p = re.search(r'Name:\s+(?P<name>\S+)\s+'
+                          '.*'
+                          '\sAttached LUN\(s\):\s+(?P<luns>\d*)\s',
+                          output.strip(), re.MULTILINE | re.DOTALL)
+            if p:
+                name = p.group('name')
+                luns = p.group('luns')
+                if name.startswith(snap_prefix) and not luns:
+                    snaplist.append({'name': name, 'luns': luns})
+        return snaplist
+
     def create_snapshot(self, lun_id, name):
         if lun_id is not None:
             command_create_snapshot = ('snap', '-create',
@@ -782,14 +807,14 @@ class CommandLineHelper(object):
             else:
                 self._raise_cli_error(command_copy_snapshot, rc, out)
 
-    def delete_snapshot(self, name):
+    def delete_snapshot(self, name, poll=True):
 
         def delete_snapshot_success():
             command_delete_snapshot = ('snap', '-destroy',
                                        '-id', name,
                                        '-o')
             out, rc = self.command_execute(*command_delete_snapshot,
-                                           poll=True)
+                                           poll=poll)
             if rc != 0:
                 # Ignore the error that due to retry
                 if rc == 5 and out.find("not exist") >= 0:
@@ -884,7 +909,7 @@ class CommandLineHelper(object):
 
     @utils.retry(EMCLunNotAvailableException,
                  interval=30, retries=10, backoff_rate=1)
-    def migrate_lun(self, src_id, dst_id):
+    def migrate_start(self, src_id, dst_id):
         command_migrate_lun = ('migrate', '-start',
                                '-source', src_id,
                                '-dest', dst_id,
@@ -904,11 +929,35 @@ class CommandLineHelper(object):
                 self._raise_cli_error(command_migrate_lun, rc, out)
         return rc
 
+    def migrate_lun_without_verification(self, src_id, dst_id):
+        """Start a migration session from src_id to dst_id.
+
+        :param src_id: source LUN id
+        :param dst_id: destination LUN id
+
+        NOTE: This method will ignore any errors, error-handling
+        is located in verification function.
+        """
+        try:
+            self.migrate_start(src_id, dst_id)
+        except exception.EMCVnxCLICmdError as ex:
+            with excutils.save_and_reraise_exception(reraise=False):
+                # Here we just log whether migration command has started
+                # successfully, post error handling is needed when verify
+                # this migration session
+                LOG.warning(_LW("Starting migration from %(src)s to %(dst)s "
+                                "failed. Will check whether migration was "
+                                "successful later."
+                                ": %(msg)s"), {'src': src_id,
+                                               'dst': dst_id,
+                                               'msg': ex.kwargs['out']})
+        return True
+
     def migrate_lun_with_verification(self, src_id,
                                       dst_id=None,
                                       dst_name=None):
         try:
-            self.migrate_lun(src_id, dst_id)
+            self.migrate_start(src_id, dst_id)
         except exception.EMCVnxCLICmdError as ex:
             migration_succeed = False
             orig_out = "\n".join(ex.kwargs["out"])
@@ -1736,7 +1785,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '05.05.04'
+    VERSION = '05.06.00'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
@@ -1789,6 +1838,12 @@ class EMCVnxCliBase(object):
             self.configuration.force_delete_lun_in_storagegroup)
         if self.force_delete_lun_in_sg:
             LOG.warning(_LW("force_delete_lun_in_storagegroup=True"))
+        # ADD by peter
+        self.t = EMCPeriodicTask(client=self._client)
+        periodic = loopingcall.FixedIntervalLoopingCall(
+            self.t.periodic_tasks)
+        periodic.start(interval=self.t.interval,
+                       initial_delay=5)
 
     def _parse_ports(self, io_port_list, protocol):
         """Validates IO port format, supported format is a-1, b-3, a-3-0."""
@@ -1859,7 +1914,8 @@ class EMCVnxCliBase(object):
         else:
             snapshot_name = snapshot['name']
         new_snap_name = snapshot_name
-        if self._is_snapcopy_enabled(volume):
+        if (self._is_snapcopy_enabled(volume) or
+                self._is_async_migration(volume)):
             new_snap_name = self._construct_snap_name(volume)
         source_volume_name = snapshot['volume_name']
         volume_name = volume['name']
@@ -2364,10 +2420,16 @@ class EMCVnxCliBase(object):
                 new_lun_id, 'smp', base_lun_name)
             volume_metadata['snapcopy'] = 'True'
         else:
+            async_migrate = self._is_async_migration(volume)
+            # Since one snap can be only attached once,
+            # we need to copy it and allow R/W
+            if async_migrate:
+                work_flow.add(CopySnapshotTask())
+                work_flow.add(AllowReadWriteOnSnapshotTask())
             work_flow.add(CreateSMPTask(),
                           AttachSnapTask(),
                           CreateDestLunTask(),
-                          MigrateLunTask())
+                          MigrateLunTask(async_migrate=async_migrate))
             flow_engine = taskflow.engines.load(work_flow,
                                                 store=store_spec)
             flow_engine.run()
@@ -2427,11 +2489,14 @@ class EMCVnxCliBase(object):
                 new_lun_id, 'smp', base_lun_name)
         else:
             # snapcopy feature disabled, need to migrate
+            async_migrate = self._is_async_migration(volume)
+
             work_flow.add(CreateSnapshotTask(),
                           CreateSMPTask(),
                           AttachSnapTask(),
                           CreateDestLunTask(),
-                          MigrateLunTask())
+                          MigrateLunTask(
+                              async_migrate=async_migrate))
             flow_engine = taskflow.engines.load(work_flow,
                                                 store=store_spec)
             flow_engine.run()
@@ -2440,7 +2505,12 @@ class EMCVnxCliBase(object):
             if consistencygroup_id:
                 self._client.delete_cgsnapshot(snapshot)
             else:
-                self.delete_snapshot(snapshot)
+                if not self._is_async_migration(volume):
+                    self.delete_snapshot(snapshot)
+                else:
+                    LOG.info(_LI('Volume clone is completed, snapshot %s'
+                                 'will be deleted by periodic task later.'),
+                             snapshot['name'])
             # After migration, volume's base lun is itself
             pl = self._build_provider_location(
                 new_lun_id, 'lun', volume['name'])
@@ -2470,6 +2540,11 @@ class EMCVnxCliBase(object):
     def _is_snapcopy_enabled(self, volume):
         meta = self._get_volume_metadata(volume)
         return 'snapcopy' in meta and meta['snapcopy'].lower() == 'true'
+
+    def _is_async_migration(self, volume):
+        meta = self._get_volume_metadata(volume)
+        return ('async_migrate' in meta and
+                meta['async_migrate'].lower() == 'true')
 
     def _get_base_lun_name(self, volume):
         """Returns base LUN name for SMP or LUN."""
@@ -3495,8 +3570,9 @@ class MigrateLunTask(task.Task):
 
     Reversion strategy: None
     """
-    def __init__(self):
+    def __init__(self, async_migrate=True):
         super(MigrateLunTask, self).__init__(provides='new_lun_id')
+        self.async_migrate = async_migrate
 
     def execute(self, client, dest_vol_name, volume, lun_data,
                 *args, **kwargs):
@@ -3506,16 +3582,19 @@ class MigrateLunTask(task.Task):
         dest_vol_lun_id = lun_data['lun_id']
 
         LOG.info(_LI('Migrating Mount Point Volume: %s'), new_vol_name)
-
-        migrated = client.migrate_lun_with_verification(new_vol_lun_id,
-                                                        dest_vol_lun_id,
-                                                        None)
-        if not migrated:
-            msg = (_LE("Migrate volume failed between source vol %(src)s"
-                       " and dest vol %(dst)s."),
-                   {'src': new_vol_name, 'dst': dest_vol_name})
-            LOG.error(msg)
-            raise exception.VolumeBackendAPIException(data=msg)
+        if not self.async_migrate:
+            migrated = client.migrate_lun_with_verification(new_vol_lun_id,
+                                                            dest_vol_lun_id,
+                                                            None)
+            if not migrated:
+                msg = (_LE("Migrate volume failed between source vol %(src)s"
+                           " and dest vol %(dst)s."),
+                       {'src': new_vol_name, 'dst': dest_vol_name})
+                LOG.error(msg)
+                raise exception.VolumeBackendAPIException(data=msg)
+        else:
+            client.migrate_lun_without_verification(
+                new_vol_lun_id, dest_vol_lun_id)
 
         return new_vol_lun_id
 
@@ -3556,3 +3635,31 @@ class CreateSnapshotTask(task.Task):
                                 'delete temp snapshot %s'),
                             snapshot['name'])
                 client.delete_snapshot(snapshot['name'])
+
+
+class EMCPeriodicTask(periodic_task.PeriodicTasks):
+    def __init__(self, client, interval=DEFAULT_INTERVAL):
+        self.interval = interval
+        self.client = client
+        super(EMCPeriodicTask, self).__init__()
+
+    @periodic_task.periodic_task
+    def cleanup_temp_snapshot(self, context):
+        """Periodic task to clean up the temporary snapshot.
+
+         this will delete snapshots starting from `tmp-snap-` if
+         no mount point attached.
+
+         :param context: passed in by framework
+         """
+        snapshots = self.client.get_snapshots('tmp-snap-')
+        for snap in snapshots:
+            # if no attached snapshot
+            self.client.delete_snapshot(snap['name'], poll=False)
+            LOG.debug('temp snapshot %s is deleted.', snap['name'])
+        LOG.debug('Cleanup done.')
+
+    def periodic_tasks(self, raise_on_error=False):
+        """Tasks to be run at a periodic interval."""
+        ctx = context.get_admin_context()
+        return self.run_periodic_tasks(ctx, raise_on_error=raise_on_error)

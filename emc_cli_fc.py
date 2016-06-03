@@ -55,6 +55,8 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
         5.2.0 - Pool-aware scheduler support
         5.3.0 - Consistency group modification support
         5.4.0 - White list target ports support
+        5.5.4 - Snap copy support
+        5.6.0 - Asynchronous migration support
     """
 
     def __init__(self, *args, **kwargs):

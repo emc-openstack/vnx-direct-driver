@@ -314,11 +314,36 @@ __Constraints:__
 
 * The number of snap-copy volume created from a single source volume is limited to
   255 at one point in time.
-* The source volume which has snap-copy volume can not be deleted.
-* The source volume which has snap-copy volume can not be migrated.
+* The source volume which has snap-copy volume can not be deleted/migrated.
 * snapcopy volume will be change to full-copy volume after host-assisted or storage-assisted migration.
 * snapcopy volume can not be added to consisgroup because of VNX limitation.
 
+## Asynchronous migration support
+
+* Metadata Key: `async_migrate`
+* Possible Values:
+    * `True` or `true`
+    * `False` or `false`
+* Default: `False`
+
+Currently VNX Cinder driver leverages LUN migration when creating a copied
+volume. By default, user may need to wait a long time before the volume to be
+`available` for other operations.
+
+Now user can add `--metadata async_migrate=true` when creating copied volume,
+which makes the volume `available` before LUN migration completes.
+Examples:
+
+        cinder create --source-volid <source-void> --name "cloned_volume" --metadata async_migrate=True
+
+or
+
+        cinder create --snapshot-id <snapshot-id> --name "vol_from_snapshot" --metadata async_migrate=True
+
+__Constraints:__
+
+* Source volume and the copied volume cannot be deleted/migrated/retyped before
+  migration completes on VNX.
 
 ##  Volume number threshold
 
