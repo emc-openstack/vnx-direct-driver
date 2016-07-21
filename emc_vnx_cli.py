@@ -15,6 +15,7 @@
 """
 VNX CLI
 """
+import functools
 import math
 import os
 import random
@@ -1785,7 +1786,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '05.06.00'
+    VERSION = '05.06.01'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
@@ -3173,8 +3174,7 @@ class EMCVnxCliBase(object):
 
     def initialize_connection(self, volume, connector):
         """Initializes the connection and returns connection info."""
-        @lockutils.synchronized('emc-connection-' + connector['host'],
-                                "emc-connection-", True)
+        @conditional_lock(lock=self.destroy_empty_sg, host=connector['host'])
         def do_initialize_connection():
             return self.assure_host_access(
                 volume, connector)
@@ -3201,8 +3201,7 @@ class EMCVnxCliBase(object):
 
     def terminate_connection(self, volume, connector):
         """Disallow connection from connector."""
-        @lockutils.synchronized('emc-connection-' + connector['host'],
-                                "emc-connection-", True)
+        @conditional_lock(lock=self.destroy_empty_sg, host=connector['host'])
         def do_terminate_connection():
             hostname = connector['host']
             volume_name = volume['name']
@@ -3635,6 +3634,14 @@ class CreateSnapshotTask(task.Task):
                                 'delete temp snapshot %s'),
                             snapshot['name'])
                 client.delete_snapshot(snapshot['name'])
+
+
+def conditional_lock(lock=False, host=None):
+    if lock:
+        return lockutils.synchronized('emc-connection-' + host,
+                                      'emc-connection-', True)
+    else:
+        return functools.partial
 
 
 class EMCPeriodicTask(periodic_task.PeriodicTasks):
