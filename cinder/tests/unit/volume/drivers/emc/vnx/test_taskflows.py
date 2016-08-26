@@ -136,7 +136,7 @@ class TestTaskflow(test.TestCase):
             'client': client,
             'snap_name': 'snap_name'
         }
-        self.work_flow.add(vnx_taskflow.AllowReadWriteTask())
+        self.work_flow.add(vnx_taskflow.ModifySnapshotTask())
         engine = taskflow.engines.load(self.work_flow,
                                        store=store_spec)
         engine.run()
@@ -147,7 +147,7 @@ class TestTaskflow(test.TestCase):
             'client': client,
             'snap_name': 'snap_name'
         }
-        self.work_flow.add(vnx_taskflow.AllowReadWriteTask())
+        self.work_flow.add(vnx_taskflow.ModifySnapshotTask())
         engine = taskflow.engines.load(self.work_flow,
                                        store=store_spec)
         self.assertRaises(vnx_ex.VNXSnapError,

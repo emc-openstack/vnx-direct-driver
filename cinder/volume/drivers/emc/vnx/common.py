@@ -38,6 +38,8 @@ INTERVAL_20_SEC = 20
 INTERVAL_30_SEC = 30
 INTERVAL_60_SEC = 60
 
+SNAP_EXPIRATION_HOUR = '1h'
+
 EMC_VNX_OPTS = [
     cfg.StrOpt('storage_vnx_authentication_type',
                default='global',
@@ -160,7 +162,7 @@ class ExtraSpecs(object):
                 value = enum_class.parse(value)
             except ValueError:
                 reason = (_("The value %(value)s for key %(key)s in extra "
-                            "specs is invalid."),
+                            "specs is invalid.") %
                           {'key': key, 'value': value})
                 raise exception.InvalidVolumeType(reason=reason)
         return value
