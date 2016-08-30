@@ -61,7 +61,7 @@ driver.
         volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
         initiator_auto_registration=True
 
-For more details on multi-backends, see [OpenStack Cloud Administration Guide](http://docs.openstack.org/admin-guide-cloud/index.html)
+For more details on multiple-storage back ends, see [Configure multiple-storage back ends](http://docs.openstack.org/admin-guide/blockstorage_multi_backend.html)
 
 ## Required Configurations
 
@@ -109,15 +109,14 @@ Specify the absolute path to your naviseccli.
 * For FC Driver, add following option:
 
 ```
-        volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
+    volume_driver=cinder.volume.drivers.emc.emc_cli_fc.EMCCLIFCDriver
 ```
 
 * For iSCSI Driver, add following option:
 
 ```
-        volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
+    volume_driver=cinder.volume.drivers.emc.emc_cli_iscsi.EMCCLIISCSIDriver
 ```
-
 ## Optional Configurations
 
 ### VNX Pool Names
@@ -187,9 +186,9 @@ capacity) to be larger than the pool's total capacity.
 provisioned capacity over total capacity.
 
 The default value of `max_over_subscription_ratio` is 20.0, which means the
-provisioned capacity can not exceed the total capacity. If the value of this
-ratio is set larger than 1.0, the provisioned capacity can exceed the total
-capacity.
+provisioned capacity can be 20 times of the total capacity.  If the value of 
+this ratio is set larger than 1.0, the provisioned capacity can exceed the 
+total capacity.
 
 ### Storage group automatic deletion
 
@@ -206,8 +205,8 @@ consistent lock_path is required for operation synchronization for this behavior
 ### Initiator auto deregistration
 
 Enabling storage group automatic deletion is the precondition of this function.
-If `initiator_auto_deregistration=True` is set, the driver will deregister all the
-initiators of the host after its storage group is deleted.
+If `initiator_auto_deregistration=True` is set, the driver will deregister all
+FC and iSCSI initiators of the host after its storage group is deleted.
 
 ### FC SAN auto zoning
 
@@ -239,13 +238,13 @@ iSCSI target portal will be chosen in a relative random way.
 
 __This option is only valid for iSCSI driver.__
 
-Here is an example.  VNX will connect `host1` with `10.0.0.1` and `10.0.0.2`.
+Here is an example. VNX will connect `host1` with `10.0.0.1` and `10.0.0.2`.
 And it will connect `host2` with `10.0.0.3`.
 
 The key name (like `host1` in the example) should be the output of command
 `hostname`.
 
-        iscsi_initiators = {"host1":["10.0.0.1", "10.0.0.2"],"host2":["10.0.0.3"]}
+    iscsi_initiators = {"host1":["10.0.0.1", "10.0.0.2"],"host2":["10.0.0.3"]}
 
 ### Default Timeout
 
@@ -258,7 +257,7 @@ The default value for this option is infinite.
 
 Example:
 
-        default_timeout = 10
+    default_timeout = 60
 
 ### Max LUNs per storage group
 

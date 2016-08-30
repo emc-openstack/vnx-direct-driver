@@ -76,9 +76,7 @@ In VNX Driver, we defined several extra specs.  They are introduced below:
 __Note__:
 
 `provisioning:type` replaces the old spec key `storagetype:provisioning`.
-The latter one will be obsoleted in the next release.
-If both `provisioning:type`and `storagetype:provisioning` are set in the volume
-type, the value of `provisioning:type` will be used.
+The latter one is obsoleted in the *Mitaka* release.
 
 ## Storage Tiering Support
 
@@ -118,7 +116,7 @@ of the deduplicated LUN align with the settings of the pool.
 
 VNX has FAST Cache feature which requires the FAST Cache license activated on
 the VNX.  Volume will be created on the backend with FAST cache enabled when
-`True` is specified.
+`<is> True` is specified.
 
 ## Pool Name
 
@@ -138,7 +136,7 @@ Here is an example about the volume type creation:
 
 ## Obsoleted extra specs
 
-Please avoid using following extra spec keys.
+Please *DO NOT* using following obsoleted extra spec keys.
 
 * `storagetype:provisioning`
 * `storagetype:pool`

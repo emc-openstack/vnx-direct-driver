@@ -1,6 +1,6 @@
 # VNX Cinder Driver
 
-Copyright (c) 2012 - 2015 EMC Corporation, Inc.
+Copyright (c) 2012 - 2016 EMC Corporation, Inc.
 All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,6 +19,8 @@ under the License.
 
 * Latest Driver: 
      * [OpenStack](https://github.com/openstack/cinder)
+* Latest Driver for Liberty:
+     * [EMC Github](https://github.com/emc-openstack/vnx-direct-driver/tree/liberty)
 * Latest Driver for Kilo:
      * [EMC Github](https://github.com/emc-openstack/vnx-direct-driver/tree/kilo)
 * Latest Driver for Juno:
@@ -35,13 +37,12 @@ defined in Block Storage.
 EMCCLIISCSIDriver (EMC VNX iSCSI driver) is based on the ISCSIDriver defined in 
 Block Storage.
 
-
 ### Table of Contents
 * [__Overview__](vnxCinder/Overview.md)
     * Supported OpenStack Release
     * Requirements
     * Supported Operations
-* [__Feature Support List__](featureSupportList.md)
+* [__Feature Support List__](vnxCinder/featureSupportList.md)
 * [__Preparation__](vnxCinder/Preparation.md)
     * Install Navisphere CLI
     * Check Array Software

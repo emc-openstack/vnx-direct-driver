@@ -56,15 +56,17 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                 White list target ports support
                 Snap copy support
                 Support efficient non-disruptive backup
-        6.1.0 - Snap copy via metadata
+        7.0.0 - Clone consistency group support
+                Replication v2 support(managed)
+                Configurable migration rate support
     """
 
     def __init__(self, *args, **kwargs):
-
         super(EMCCLIISCSIDriver, self).__init__(*args, **kwargs)
         self.cli = emc_vnx_cli.getEMCVnxCli(
             'iSCSI',
-            configuration=self.configuration)
+            configuration=self.configuration,
+            active_backend_id=kwargs.get('active_backend_id'))
         self.VERSION = self.cli.VERSION
 
     def check_for_setup_error(self):
@@ -135,7 +137,6 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                     'target_iqn': 'iqn.2010-10.org.openstack:volume-00000001',
                     'target_portal': '127.0.0.0.1:3260',
                     'target_lun': 1,
-                    'access_mode': 'rw'
                 }
             }
 
@@ -149,7 +150,6 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                                     'iqn.2010-10.org.openstack:volume-00002'],
                     'target_portals': ['127.0.0.1:3260', '127.0.1.1:3260'],
                     'target_luns': [1, 1],
-                    'access_mode': 'rw'
                 }
             }
 
@@ -199,7 +199,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
             'source-name':<lun name in VNX>
         }
         """
-        self.cli.manage_existing(volume, existing_ref)
+        return self.cli.manage_existing(volume, existing_ref)
 
     def manage_existing_get_size(self, volume, existing_ref):
         """Return size of volume to be managed by manage_existing."""
@@ -209,19 +209,20 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
         """Creates a consistencygroup."""
         return self.cli.create_consistencygroup(context, group)
 
-    def delete_consistencygroup(self, context, group):
+    def delete_consistencygroup(self, context, group, volumes):
         """Deletes a consistency group."""
         return self.cli.delete_consistencygroup(
-            self, context, group)
+            context, group, volumes)
 
-    def create_cgsnapshot(self, context, cgsnapshot):
+    def create_cgsnapshot(self, context, cgsnapshot, snapshots):
         """Creates a cgsnapshot."""
         return self.cli.create_cgsnapshot(
-            self, context, cgsnapshot)
+            context, cgsnapshot, snapshots)
 
-    def delete_cgsnapshot(self, context, cgsnapshot):
+    def delete_cgsnapshot(self, context, cgsnapshot, snapshots):
         """Deletes a cgsnapshot."""
-        return self.cli.delete_cgsnapshot(self, context, cgsnapshot)
+        return self.cli.delete_cgsnapshot(
+            context, cgsnapshot, snapshots)
 
     def get_pool(self, volume):
         """Returns the pool name of a volume."""
@@ -247,7 +248,9 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                                                          group,
                                                          volumes,
                                                          cgsnapshot,
-                                                         snapshots)
+                                                         snapshots,
+                                                         source_cg,
+                                                         source_vols)
 
     def update_migrated_volume(self, context, volume, new_volume,
                                original_volume_status=None):
@@ -277,3 +280,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
 
     def backup_use_temp_snapshot(self):
         return True
+
+    def failover_host(self, context, volumes, secondary_backend_id):
+        """Failovers volume from primary device to secondary."""
+        return self.cli.failover_host(context, volumes, secondary_backend_id)

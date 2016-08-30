@@ -49,6 +49,6 @@ native volume migration functionality.
 In following scenarios, VNX storage-assisted volume migration will not be
 triggered:
 
-1. Volume migration between back ends with different storage protocol, ex,
+1. `in-use` volume migration between back ends with different storage protocol, ex,
    FC and iSCSI.
 2. Volume is to be migrated across arrays.

@@ -7,13 +7,19 @@ management, diagnostics and reporting functions for VNX.
 
 ## Supported OpenStack Release
 
-This driver supports Liberty release.
+This driver supports Mitaka release.
+
+## Important Changes in Mitaka
+
+* `storagetype:provisioning` extra spec has been deprecated, use `provisioning:type` instead.
+* `storagetype:pool` extra spec has been deprecated, use `pool_name` instead
 
 ## Requirements
 
 * VNX OE for Block version 5.32 or higher.
 * VNX Snapshot and Thin Provisioning license should be activated for VNX.
 * Navisphere CLI v7.32 or higher is installed along with the driver.
+* `storops` python library is required, install it via `sudo pip install storops`.
 
 ## Supported Operations
 
@@ -31,4 +37,7 @@ The following operations are supported:
 * Create and delete consistency groups
 * Create and delete consistency group snapshots
 * Modify consistency group
+* Create a cloned consistency group
+* create consistency group from consistency group snapshots
 * Efficient non-disruptive volume backup
+* Replication v2.1 support
