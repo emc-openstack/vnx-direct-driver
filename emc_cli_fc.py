@@ -61,6 +61,7 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
         7.0.0 - Clone consistency group support
                 Replication v2 support(managed)
                 Configurable migration rate support
+        7.1.0 - Asynchronous migration support
     """
 
     def __init__(self, *args, **kwargs):
