@@ -29,7 +29,7 @@ Make sure your have following software installed for certain features.
 You can check the status of your array software in the "Software" page of
 "Storage System Properties".  Here is how it looks like.
 
-![example](../imgs/enabler.png)
+![example](imgs/enabler.png)
 
 ## Install EMC VNX Driver (Optional)
 

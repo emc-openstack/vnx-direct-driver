@@ -41,7 +41,6 @@ Block Storage.
     * Supported OpenStack Release
     * Requirements
     * Supported Operations
-* [__Feature Support List__](featureSupportList.md)
 * [__Preparation__](vnxCinder/Preparation.md)
     * Install Navisphere CLI
     * Check Array Software

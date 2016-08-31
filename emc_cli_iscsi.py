@@ -57,6 +57,7 @@ class EMCCLIISCSIDriver(driver.ISCSIDriver):
                 Snap copy support
                 Support efficient non-disruptive backup
         6.1.0 - Snap copy via metadata
+        6.2.0 - Asynchronous migration support
     """
 
     def __init__(self, *args, **kwargs):

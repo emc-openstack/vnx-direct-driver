@@ -1,16 +1,5 @@
 # Advanced Features
 
-## Read-only volumes
-
-OpenStack supports read-only volumes.  The following command can be used to set a
-volume as read-only.
-
-        cinder --os-username admin --os-tenant-name admin readonly-mode-update <volume> True
-
-After a volume is marked as read-only, the driver will forward the information
-when a hypervisor is attaching the volume and the hypervisor will make sure the
-volume is read-only.
-
 ## Snap copy
 
 * Metadata Key: `snapcopy`
@@ -54,6 +43,41 @@ __Constraints:__
 * The source volume which has snap-copy volume can not be migrated.
 * snapcopy volume will be change to full-copy volume after host-assisted or storage-assisted migration.
 * snapcopy volume can not be added to consisgroup because of VNX limitation.
+
+## Asynchronous migration support
+
+* Metadata Key: `async_migrate`
+* Possible Values:
+    * `True` or `true`
+    * `False` or `false`
+* Default: `False`
+
+Currently VNX Cinder driver leverages LUN migration when creating a cloned
+volume or a volume from snapshot.
+By default, user has to wait a long time before the volume becomes
+`available`.
+
+Now user can add `--metadata async_migrate=true` when creating a cloned volume
+or a volume from snapshot, which makes the volume `available` when LUN
+migration starts.
+
+Examples:
+
+        cinder create --source-volid <source-void> --name "cloned_volume" --metadata async_migrate=True
+
+or
+
+        cinder create --snapshot-id <snapshot-id> --name "vol_from_snapshot" --metadata async_migrate=True
+
+__Constraints:__
+
+* Source volume cannot be deleted/migrated/retyped before
+  migration completes on VNX.
+* Following operations cannot be performed on the newly created volume before
+  migration completes on VNX.
+  - Migrate volume
+  - Retype volume
+  - Take snapshot
 
 ## Efficient non-disruptive volume backup
 
