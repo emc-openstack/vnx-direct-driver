@@ -37,11 +37,9 @@ from taskflow.patterns import linear_flow
 from taskflow import task
 from taskflow.types import failure
 
-from cinder import context
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
 from cinder.openstack.common import loopingcall
-from cinder.openstack.common import periodic_task
 
 from cinder import utils
 from cinder.volume import configuration as config
@@ -59,7 +57,7 @@ INTERVAL_5_SEC = 5
 INTERVAL_20_SEC = 20
 INTERVAL_30_SEC = 30
 INTERVAL_60_SEC = 60
-DEFAULT_INTERVAL = 300
+SNAP_EXPIRATION_HOUR = 1
 
 ENABLE_TRACE = False
 
@@ -175,6 +173,16 @@ class EMCLunNotAvailableException(exception.EMCVnxCLICmdError):
                 "(Return Code: %(rc)s) (Output: %(out)s).")
 
 
+class EMCLunUsedByFeature(exception.EMCVnxCLICmdError):
+    message = ("LUN is used by a feature of the storage system: %(cmd)s "
+               "(Return Code: %(rc)s) (Output: %(out)s).")
+
+
+class EMCLunInSG(exception.EMCVnxCLICmdError):
+    message = ("LUN is still in some storage group(s): %(cmd)s "
+               "(Return Code: %(rc)s) (Output: %(out)s).")
+
+
 class PropertyDescriptor(object):
     def __init__(self, option, label, key, converter=None):
         self.option = option
@@ -276,6 +284,9 @@ class CommandLineHelper(object):
     CLI_RESP_PATTERN_LUN_IN_SG_2 = 'Host LUN/LUN mapping still exists'
     CLI_RESP_PATTERN_LUN_NOT_MIGRATING = ('The specified source LUN '
                                           'is not currently migrating')
+    CLI_RESP_PATTERN_LUN_USED_BY_FEATURE = (
+        "Cannot unbind LUN because it's being used by"
+        " a feature of the Storage System")
 
     def __init__(self, configuration):
         configuration.append_config_values(san.san_opts)
@@ -479,8 +490,25 @@ class CommandLineHelper(object):
                 LOG.warning(_LW("LUN is already deleted, LUN name %(name)s. "
                                 "Message: %(msg)s"),
                             {'name': name, 'msg': out})
+            elif (rc == 156 and
+                    self.CLI_RESP_PATTERN_LUN_USED_BY_FEATURE in out):
+                LOG.info(_LW("LUN %(name)s is used by a feature."
+                             "Message: %(msg)s"),
+                         {'name': name, 'msg': out})
+                raise EMCLunUsedByFeature(cmd=command_delete_lun,
+                                          rc=rc,
+                                          out=out)
+            elif (self.CLI_RESP_PATTERN_LUN_IN_SG_1 in out or
+                    self.CLI_RESP_PATTERN_LUN_IN_SG_2 in out):
+                raise EMCLunInSG(cmd=command_delete_lun,
+                                 rc=rc,
+                                 out=out)
             else:
                 self._raise_cli_error(command_delete_lun, rc, out)
+
+    def remove_lun_from_sg(self, name, lun_id):
+        for hlu, sg in self.get_hlus(lun_id):
+            self.remove_hlu_from_storagegroup(hlu, sg)
 
     def get_hlus(self, lun_id, poll=True):
         hlus = list()
@@ -507,14 +535,15 @@ class CommandLineHelper(object):
 
     def _wait_for_a_condition(self, testmethod, timeout=None,
                               interval=INTERVAL_5_SEC,
-                              ignorable_exception_arbiter=lambda ex: True):
+                              ignorable_exception_arbiter=lambda ex: True,
+                              *args, **kwargs):
         start_time = time.time()
         if timeout is None:
             timeout = self.timeout
 
         def _inner():
             try:
-                test_value = testmethod()
+                test_value = testmethod(*args, **kwargs)
             except Exception as ex:
                 test_value = False
                 with excutils.save_and_reraise_exception(
@@ -708,16 +737,17 @@ class CommandLineHelper(object):
             LOG.info(_LI('Consistency group %s was deleted '
                          'successfully.'), cg_name)
 
-    def create_cgsnapshot(self, cgsnapshot):
-        """Create a cgsnapshot (snap group)."""
+    def create_cgsnapshot(self, cgsnapshot, keep_for=None):
+        """Create a cgsnapshot (snap group).
+
+        :param cgsnapshot: cg snapshot object
+        :param keep_for: the specified time after
+                         which the snapshot will expire
+        """
         cg_name = cgsnapshot['consistencygroup_id']
         snap_name = cgsnapshot['id']
-        create_cg_snap_cmd = ('-np', 'snap', '-create',
-                              '-res', cg_name,
-                              '-resType', 'CG',
-                              '-name', snap_name,
-                              '-allowReadWrite', 'yes',
-                              '-allowAutoDelete', 'no')
+        create_cg_snap_cmd = self._build_snapshot_cmd(
+            cg_name, snap_name, True, keep_for)
 
         out, rc = self.command_execute(*create_cg_snap_cmd)
         if rc != 0:
@@ -747,49 +777,44 @@ class CommandLineHelper(object):
             else:
                 self._raise_cli_error(delete_cg_snap_cmd, rc, out)
 
-    def get_snapshots(self, snap_prefix):
-        command_list_snapshots = ('snap', '-list',
-                                  '-detail')
-        out, rc = self.command_execute(*command_list_snapshots,
+    def create_snapshot(self, lun_id, name, keep_for=None):
+        """Create a snapshot for LUN.
+
+        :param lun_id: VNX LUN ID
+        :param name: snapshot name
+        :param keep_for: the specified time after
+                         which the snapshot will expire
+        """
+        command_create_snapshot = self._build_snapshot_cmd(
+            lun_id, name, False, keep_for)
+        out, rc = self.command_execute(*command_create_snapshot,
                                        poll=False)
         if rc != 0:
-            self._raise_cli_error(command_list_snapshots, rc, out)
-        snaplist = []
-        snaps_output = out.split('\n\n')
-        for output in snaps_output:
-            p = re.search(r'Name:\s+(?P<name>\S+)\s+'
-                          '.*'
-                          '\sAttached LUN\(s\):\s+(?P<luns>\d*)\s',
-                          output.strip(), re.MULTILINE | re.DOTALL)
-            if p:
-                name = p.group('name')
-                luns = p.group('luns')
-                if name.startswith(snap_prefix) and not luns:
-                    snaplist.append({'name': name, 'luns': luns})
-        return snaplist
+            # Ignore the error that due to retry
+            if (rc == 5 and
+                    out.find("(0x716d8005)") >= 0):
+                LOG.warning(_LW('Snapshot %(name)s already exists. '
+                                'Message: %(msg)s'),
+                            {'name': name, 'msg': out})
+            else:
+                self._raise_cli_error(command_create_snapshot, rc, out)
 
-    def create_snapshot(self, lun_id, name):
-        if lun_id is not None:
-            command_create_snapshot = ('snap', '-create',
-                                       '-res', lun_id,
-                                       '-name', name,
-                                       '-allowReadWrite', 'yes',
-                                       '-allowAutoDelete', 'no')
-
-            out, rc = self.command_execute(*command_create_snapshot,
-                                           poll=False)
-            if rc != 0:
-                # Ignore the error that due to retry
-                if (rc == 5 and
-                        out.find("(0x716d8005)") >= 0):
-                    LOG.warning(_LW('Snapshot %(name)s already exists. '
-                                    'Message: %(msg)s'),
-                                {'name': name, 'msg': out})
-                else:
-                    self._raise_cli_error(command_create_snapshot, rc, out)
+    def _build_snapshot_cmd(self, res_id, name,
+                            is_cg=False, keep_for=None):
+        command_create_snapshot = ('snap', '-create',
+                                   '-res', res_id,
+                                   '-name', name,
+                                   '-allowReadWrite', 'yes')
+        if is_cg:
+            command_create_snapshot = ('-np', ) + command_create_snapshot
+            command_create_snapshot += ('-resType', 'CG')
+        if keep_for:
+            command_create_snapshot += (
+                '-keepFor', six.text_type(keep_for) + 'h')
         else:
-            msg = _('Failed to create snapshot as no LUN ID is specified')
-            raise exception.VolumeBackendAPIException(data=msg)
+            command_create_snapshot += (
+                '-allowAutoDelete', 'no')
+        return command_create_snapshot
 
     def copy_snapshot(self, src_snap_name, new_name):
         command_copy_snapshot = ('snap', '-copy',
@@ -861,10 +886,12 @@ class CommandLineHelper(object):
 
         return rc
 
-    def allow_snapshot_readwrite_and_autodelete(self, snap_name):
+    def modify_snapshot(self, snap_name, allow_rw=True, keep_for=None):
 
         modify_cmd = ('snap', '-modify', '-id', snap_name,
-                      '-allowReadWrite', 'yes', '-allowAutoDelete', 'yes')
+                      '-allowReadWrite', 'yes' if allow_rw else 'no')
+        if keep_for:
+            modify_cmd += ('-keepFor', six.text_type(keep_for) + 'h')
 
         out, rc = self.command_execute(*modify_cmd)
         if rc != 0:
@@ -1018,20 +1045,6 @@ class CommandLineHelper(object):
                     self._raise_cli_error(cmd_migrate_list, rc, out)
             return mig_ready
 
-        def migration_disappeared(poll=False):
-            cmd_migrate_list = ('migrate', '-list', '-source', src_id)
-            out, rc = self.command_execute(*cmd_migrate_list,
-                                           poll=poll)
-            if rc != 0:
-                if re.search(self.CLI_RESP_PATTERN_LUN_NOT_MIGRATING, out):
-                    LOG.debug("Migration of LUN %s is finished.", src_id)
-                    return True
-                else:
-                    LOG.error(_LE("Failed to query migration status of LUN."),
-                              src_id)
-                    self._raise_cli_error(cmd_migrate_list, rc, out)
-            return False
-
         eventlet.sleep(INTERVAL_30_SEC)
 
         try:
@@ -1047,20 +1060,33 @@ class CommandLineHelper(object):
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE("Migration of LUN %s failed to complete."),
                           src_id)
-                self.migration_cancel(src_id)
-                self._wait_for_a_condition(migration_disappeared,
-                                           interval=INTERVAL_30_SEC)
-
+                self.cancel_migration(src_id)
         return True
 
-    # Cancel migration in case where status is faulted or stopped
-    def migration_cancel(self, src_id):
+    def migration_disappeared(self, src_id, poll=False):
+        cmd_migrate_list = ('migrate', '-list', '-source', src_id)
+        out, rc = self.command_execute(*cmd_migrate_list,
+                                       poll=poll)
+        if rc != 0:
+            if re.search(self.CLI_RESP_PATTERN_LUN_NOT_MIGRATING, out):
+                LOG.debug("Migration of LUN %s is finished.", src_id)
+                return True
+            else:
+                LOG.error(_LE("Failed to query migration status of LUN."),
+                          src_id)
+                self._raise_cli_error(cmd_migrate_list, rc, out)
+        return False
+
+    def cancel_migration(self, src_id):
         LOG.info(_LI("Cancelling Migration from LUN %s."), src_id)
         cmd_migrate_cancel = ('migrate', '-cancel', '-source', src_id,
                               '-o')
         out, rc = self.command_execute(*cmd_migrate_cancel)
         if rc != 0:
             self._raise_cli_error(cmd_migrate_cancel, rc, out)
+        self._wait_for_a_condition(self.migration_disappeared,
+                                   interval=INTERVAL_30_SEC,
+                                   src_id=src_id)
 
     def get_storage_group(self, name, poll=True):
 
@@ -1082,8 +1108,8 @@ class CommandLineHelper(object):
             self._raise_cli_error(command_get_storage_group, rc, out)
 
         data['raw_output'] = out
-        re_stroage_group_id = 'Storage Group UID:\s*(.*)\s*'
-        m = re.search(re_stroage_group_id, out)
+        re_storage_group_id = 'Storage Group UID:\s*(.*)\s*'
+        m = re.search(re_storage_group_id, out)
         if m is not None:
             data['storage_group_uid'] = m.group(1)
 
@@ -1786,7 +1812,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '05.06.01'
+    VERSION = '05.06.03'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
@@ -1839,12 +1865,6 @@ class EMCVnxCliBase(object):
             self.configuration.force_delete_lun_in_storagegroup)
         if self.force_delete_lun_in_sg:
             LOG.warning(_LW("force_delete_lun_in_storagegroup=True"))
-        # ADD by peter
-        self.t = EMCPeriodicTask(client=self._client)
-        periodic = loopingcall.FixedIntervalLoopingCall(
-            self.t.periodic_tasks)
-        periodic.start(interval=self.t.interval,
-                       initial_delay=5)
 
     def _parse_ports(self, io_port_list, protocol):
         """Validates IO port format, supported format is a-1, b-3, a-3-0."""
@@ -1918,6 +1938,10 @@ class EMCVnxCliBase(object):
         if (self._is_snapcopy_enabled(volume) or
                 self._is_async_migration(volume)):
             new_snap_name = self._construct_snap_name(volume)
+        temp_snap = False
+        if not self._is_snapcopy_enabled(volume):
+            # snapshot should be expired after some time
+            temp_snap = True
         source_volume_name = snapshot['volume_name']
         volume_name = volume['name']
         volume_size = snapshot['volume_size']
@@ -1936,7 +1960,8 @@ class EMCVnxCliBase(object):
             'provisioning': provisioning,
             'tiering': tiering,
             'volume_size': volume_size,
-            'client': self._client
+            'client': self._client,
+            'temp_snap': temp_snap,
         }
         return store_spec
 
@@ -2072,32 +2097,41 @@ class EMCVnxCliBase(object):
 
     def delete_volume(self, volume):
         """Deletes an EMC volume."""
-        try:
-            self._client.delete_lun(volume['name'])
-        except exception.EMCVnxCLICmdError as ex:
-            orig_out = "\n".join(ex.kwargs["out"])
-            if (self.force_delete_lun_in_sg and
-                    (self._client.CLI_RESP_PATTERN_LUN_IN_SG_1 in orig_out or
-                     self._client.CLI_RESP_PATTERN_LUN_IN_SG_2 in orig_out)):
-                LOG.warning(_LW('LUN corresponding to %s is still '
-                                'in some Storage Groups.'
-                                'Try to bring the LUN out of Storage Groups '
-                                'and retry the deletion.'),
-                            volume['name'])
-                lun_id = self.get_lun_id(volume)
-                for hlu, sg in self._client.get_hlus(lun_id):
-                    self._client.remove_hlu_from_storagegroup(hlu, sg)
+        def _delete_lun(volume, force=False):
+            # For LUN/SMP which is still in storage group
+            try:
                 self._client.delete_lun(volume['name'])
+            except EMCLunInSG as ex:
+                if force:
+                    LOG.warning(_LW('LUN corresponding to %s is still '
+                                    'in some Storage Groups.'
+                                    'Try to bring the LUN out of Storage '
+                                    'Groups and retry the deletion.'),
+                                volume['name'])
+                    lun_id = self.get_lun_id(volume)
+                    self._client.remove_lun_from_sg(volume['name'], lun_id)
+                    self._client.delete_lun(volume['name'])
+                else:
+                    raise ex
+        try:
+            _delete_lun(volume, self.force_delete_lun_in_sg)
+        except EMCLunUsedByFeature as ex:
+            if self._is_async_migration(volume):
+                lun_id = self.get_lun_id(volume)
+                self._client.cancel_migration(lun_id)
+                self._client.detach_mount_point(volume['name'])
+                _delete_lun(volume, self.force_delete_lun_in_sg)
             else:
-                with excutils.save_and_reraise_exception():
-                    # Reraise the original exception
-                    pass
+                raise ex
+
         if volume['provider_location']:
             lun_type = self._extract_provider_location(
                 volume['provider_location'], 'type')
             if lun_type == 'smp':
                 self._client.delete_snapshot(
                     self._construct_snap_name(volume))
+        if self._is_async_migration(volume):
+            self._client.delete_snapshot(self._construct_snap_name(volume))
 
     def extend_volume(self, volume, new_size):
         """Extends an EMC volume."""
@@ -2410,7 +2444,7 @@ class EMCVnxCliBase(object):
         volume_metadata = self._get_volume_metadata(volume)
         if self._is_snapcopy_enabled(volume):
             work_flow.add(CopySnapshotTask(),
-                          AllowReadWriteOnSnapshotTask(),
+                          ModifySnapshotTask(),
                           CreateSMPTask(),
                           AttachSnapTask())
             flow_engine = taskflow.engines.load(work_flow,
@@ -2426,7 +2460,7 @@ class EMCVnxCliBase(object):
             # we need to copy it and allow R/W
             if async_migrate:
                 work_flow.add(CopySnapshotTask())
-                work_flow.add(AllowReadWriteOnSnapshotTask())
+                work_flow.add(ModifySnapshotTask())
             work_flow.add(CreateSMPTask(),
                           AttachSnapTask(),
                           CreateDestLunTask(),
@@ -2491,27 +2525,21 @@ class EMCVnxCliBase(object):
         else:
             # snapcopy feature disabled, need to migrate
             async_migrate = self._is_async_migration(volume)
-
             work_flow.add(CreateSnapshotTask(),
                           CreateSMPTask(),
                           AttachSnapTask(),
                           CreateDestLunTask(),
-                          MigrateLunTask(
-                              async_migrate=async_migrate))
+                          MigrateLunTask(async_migrate=async_migrate))
             flow_engine = taskflow.engines.load(work_flow,
                                                 store=store_spec)
             flow_engine.run()
             new_lun_id = flow_engine.storage.fetch('new_lun_id')
-            # Delete temp Snapshot
-            if consistencygroup_id:
-                self._client.delete_cgsnapshot(snapshot)
-            else:
-                if not self._is_async_migration(volume):
-                    self.delete_snapshot(snapshot)
+            # Delete temp snapshot
+            if not self._is_async_migration(volume):
+                if consistencygroup_id:
+                    self._client.delete_cgsnapshot(snapshot)
                 else:
-                    LOG.info(_LI('Volume clone is completed, snapshot %s'
-                                 'will be deleted by periodic task later.'),
-                             snapshot['name'])
+                    self.delete_snapshot(snapshot)
             # After migration, volume's base lun is itself
             pl = self._build_provider_location(
                 new_lun_id, 'lun', volume['name'])
@@ -3531,11 +3559,16 @@ class CopySnapshotTask(task.Task):
             client.delete_snapshot(new_snap_name)
 
 
-class AllowReadWriteOnSnapshotTask(task.Task):
-    """Task to modify a Snapshot to allow ReadWrite on it."""
-    def execute(self, client, new_snap_name, *args, **kwargs):
-        LOG.debug('AllowReadWriteOnSnapshotTask.execute')
-        client.allow_snapshot_readwrite_and_autodelete(new_snap_name)
+class ModifySnapshotTask(task.Task):
+    """Task to modify a Snapshot."""
+    def execute(self, client, new_snap_name, temp_snap, *args, **kwargs):
+        LOG.debug('ModifySnapshotTask.execute')
+        keep_for = None
+        if temp_snap:
+            keep_for = SNAP_EXPIRATION_HOUR
+        client.modify_snapshot(new_snap_name,
+                               allow_rw=True,
+                               keep_for=keep_for)
 
 
 class CreateDestLunTask(task.Task):
@@ -3606,18 +3639,26 @@ class CreateSnapshotTask(task.Task):
 
     Reversion Strategy: Delete the created snapshot/cgsnapshot.
     """
-    def execute(self, client, snapshot, source_lun_id, *args, **kwargs):
+    def execute(self, client, snapshot, source_lun_id,
+                temp_snap, *args, **kwargs):
         LOG.debug('CreateSnapshotTask.execute')
+        keep_for = None
+        if temp_snap is True:
+            keep_for = SNAP_EXPIRATION_HOUR
+
         # Create temp Snapshot
         if snapshot['consistencygroup_id']:
-            client.create_cgsnapshot(snapshot)
+            client.create_cgsnapshot(snapshot,
+                                     keep_for)
         else:
             snapshot_name = snapshot['name']
             volume_name = snapshot['volume_name']
             LOG.info(_LI('Create snapshot: %(snapshot)s: volume: %(volume)s'),
                      {'snapshot': snapshot_name,
                       'volume': volume_name})
-            client.create_snapshot(source_lun_id, snapshot_name)
+            client.create_snapshot(source_lun_id,
+                                   snapshot_name,
+                                   keep_for)
 
     def revert(self, result, client, snapshot, *args, **kwargs):
         LOG.debug('CreateSnapshotTask.revert')
@@ -3642,31 +3683,3 @@ def conditional_lock(lock=False, host=None):
                                       'emc-connection-', True)
     else:
         return functools.partial
-
-
-class EMCPeriodicTask(periodic_task.PeriodicTasks):
-    def __init__(self, client, interval=DEFAULT_INTERVAL):
-        self.interval = interval
-        self.client = client
-        super(EMCPeriodicTask, self).__init__()
-
-    @periodic_task.periodic_task
-    def cleanup_temp_snapshot(self, context):
-        """Periodic task to clean up the temporary snapshot.
-
-         this will delete snapshots starting from `tmp-snap-` if
-         no mount point attached.
-
-         :param context: passed in by framework
-         """
-        snapshots = self.client.get_snapshots('tmp-snap-')
-        for snap in snapshots:
-            # if no attached snapshot
-            self.client.delete_snapshot(snap['name'], poll=False)
-            LOG.debug('temp snapshot %s is deleted.', snap['name'])
-        LOG.debug('Cleanup done.')
-
-    def periodic_tasks(self, raise_on_error=False):
-        """Tasks to be run at a periodic interval."""
-        ctx = context.get_admin_context()
-        return self.run_periodic_tasks(ctx, raise_on_error=raise_on_error)
