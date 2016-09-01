@@ -5811,6 +5811,13 @@ class EMCVNXCLIToggleSPTestCase(test.TestCase):
                           + FAKE_COMMAND), check_exit_code=True)]
             mock_utils.assert_has_calls(expected)
         time_mock.assert_not_called()
+        self.assertEqual('toggle-backend', self.cli_client.toggle_lock_name)
+
+    def test_toggle_no_config_group(self, time_mock):
+        self.configuration.config_group = None
+        my_client = emc_vnx_cli.CommandLineHelper(
+            configuration=self.configuration)
+        self.assertEqual('default', my_client.toggle_lock_name)
 
     def test_toggle_sp_with_server_unavailabe(self, time_mock):
         self.cli_client.active_storage_ip = '10.10.10.10'

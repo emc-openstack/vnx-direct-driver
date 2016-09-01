@@ -713,7 +713,8 @@ class CommandLineHelper(object):
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
         # Lock file name for this specific back-end
-        self.toggle_lock_name = configuration.config_group
+        self.toggle_lock_name = (configuration.config_group if
+                                 configuration.config_group else 'default')
         self.credentials = ()
         storage_username = configuration.san_login
         storage_password = configuration.san_password
@@ -2124,7 +2125,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '07.00.01'
+    VERSION = '07.00.02'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',
