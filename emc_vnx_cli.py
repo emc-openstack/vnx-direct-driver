@@ -462,6 +462,7 @@ class CommandLineHelper(object):
                                         ignore_thresholds=False,
                                         poll=True):
         command_create_lun = ['lun', '-create',
+                              '-aa', '1',
                               '-capacity', size,
                               '-sq', 'gb',
                               '-poolName', pool,
@@ -1828,7 +1829,7 @@ class CommandLineHelper(object):
 class EMCVnxCliBase(object):
     """This class defines the functions to use the native CLI functionality."""
 
-    VERSION = '06.02.01'
+    VERSION = '06.02.02'
     stats = {'driver_version': VERSION,
              'storage_protocol': None,
              'vendor_name': 'EMC',

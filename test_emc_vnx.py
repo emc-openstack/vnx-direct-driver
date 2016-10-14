@@ -672,6 +672,7 @@ class EMCVNXCLIDriverTestData(object):
                          provisioning=None, tiering=None,
                          ignore_thresholds=False, poll=True):
         initial = ['lun', '-create',
+                   '-aa', '1',
                    '-capacity', size,
                    '-sq', 'gb',
                    '-poolName', pool,
@@ -3759,7 +3760,7 @@ Time Remaining:  0 second(s)
         expect_cmd = [
             mock.call('connection', '-getport', '-address', '-vlanid',
                       poll=False),
-            mock.call('-np', 'lun', '-create', '-capacity',
+            mock.call('-np', 'lun', '-create', '-aa', '1', '-capacity',
                       1, '-sq', 'gb', '-poolName',
                       self.testData.test_pool_name,
                       '-name', 'volume-1', '-type', 'NonThin')]
