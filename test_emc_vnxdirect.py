@@ -598,6 +598,7 @@ class EMCVNXCLIDriverTestData(object):
     def LUN_CREATION_CMD(self, name, size, pool, provisioning, tiering,
                          poll=True):
         initial = ['lun', '-create',
+                   '-aa', '1',
                    '-capacity', size,
                    '-sq', 'gb',
                    '-poolName', pool,
@@ -3496,11 +3497,9 @@ Time Remaining:  0 second(s)
         expect_cmd = [
             mock.call('connection', '-getport', '-address', '-vlanid',
                       poll=False),
-            mock.call('-np', 'lun', '-create', '-capacity',
-                      1, '-sq', 'gb', '-poolName',
-                      self.testData.test_pool_name,
-                      '-name', 'vol_with_type', '-type', 'NonThin')
-        ]
+            mock.call(*self.testData.LUN_CREATION_CMD(
+                      'vol_with_type', 1, self.testData.test_pool_name,
+                      False, None, poll=False))]
 
         fake_cli.assert_has_calls(expect_cmd)
 
