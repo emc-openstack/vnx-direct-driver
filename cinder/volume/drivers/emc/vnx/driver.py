@@ -78,9 +78,11 @@ class EMCVNXDriver(driver.TransferVD,
                 https://review.openstack.org/#/c/462894
         8.1.2 - Extend SMP size before aync migration when cloning from an
                 image cache volume
+        8.1.3 - Cherry pick `wrong size of volume from image cache` fix from
+                Pike, https://review.openstack.org/#/c/476402/
     """
 
-    VERSION = '08.01.02'
+    VERSION = '08.01.03'
     VENDOR = 'Dell EMC'
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "EMC_VNX_CI"

@@ -1064,6 +1064,9 @@ test_create_cloned_volume:
   snap: &snap_for_clone
     _methods:
       delete:
+  thick_base_lun: &test_create_cloned_volume_thick_base_lun
+    _properties:
+      is_thin_lun: fase
   smp: &smp_migrate
     _properties:
       <<: *lun_base_prop
@@ -1072,6 +1075,7 @@ test_create_cloned_volume:
       poll: false
       is_thin_lun: false
       total_capacity_gb: 10
+      primary_lun: *test_create_cloned_volume_thick_base_lun
     _methods:
       migrate:
       update:
@@ -1136,6 +1140,7 @@ test_create_volume_from_snapshot:
     _properties:
       is_thin_lun: false
       total_capacity_gb: 10
+      primary_lun: *test_create_cloned_volume_thick_base_lun
     _methods:
       attach_snap:
   vnx:
@@ -2055,12 +2060,16 @@ test_create_cg_snapshot_task_revert:
       get_snap: *snap_create_cg_revert
 
 test_extend_smp_task:
+  thin_base_lun: &test_extend_smp_task_thin_base_lun
+    _properties:
+      is_thin_lun: true
   lun: &lun_test_extend_smp_task
     _properties:
       <<: *lun_base_prop
       name: lun_test_extend_smp_task
       is_thin_lun: true
       total_capacity_gb: 10
+      primary_lun: *test_extend_smp_task_thin_base_lun
   new_lun: &new_lun_test_extend_smp_task
     _properties:
       <<: *lun_base_prop
@@ -2083,17 +2092,22 @@ test_extend_smp_task_skip_small_size:
       name: lun_test_extend_smp_task_skip_small_size
       is_thin_lun: true
       total_capacity_gb: 1
+      primary_lun: *test_extend_smp_task_thin_base_lun
   vnx:
     _methods:
       get_lun: *lun_test_extend_smp_task_skip_small_size
 
 test_extend_smp_task_skip_thick: &test_extend_smp_task_skip_thick
+  thick_base_lun: &test_extend_smp_task_thick_base_lun
+    _properties:
+      is_thin_lun: false
   lun: &lun_test_extend_smp_task_skip_thick
     _properties:
       <<: *lun_base_prop
       name: lun_test_extend_smp_task_skip_thick
       is_thin_lun: false
       total_capacity_gb: 10
+      primary_lun: *test_extend_smp_task_thick_base_lun
   vnx:
     _methods:
       get_lun: *lun_test_extend_smp_task_skip_thick

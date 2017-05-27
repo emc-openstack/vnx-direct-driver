@@ -324,14 +324,18 @@ class ExtendSMPTask(task.Task):
     def execute(self, client, smp_name, lun_size, *args, **kwargs):
         LOG.debug('%s.execute', self.__class__.__name__)
         smp = client.get_lun(name=smp_name)
-        if smp.is_thin_lun and lun_size > smp.total_capacity_gb:
-            client.expand_lun(smp_name, lun_size)
+        if lun_size > smp.total_capacity_gb:
+            if smp.primary_lun.is_thin_lun:
+                client.expand_lun(smp_name, lun_size)
+            else:
+                LOG.warning(
+                    _LW('Not extending the SMP: %s, because its base lun '
+                        'is not thin.', smp_name))
         else:
-            LOG.info(_LI('Not extend the SMP: %(smp)s, size: %(size)s, thin: '
-                         '%(thin)s, due to the new size: %(new_size)s is '
-                         'smaller, or it is not thin.'),
+            LOG.info('Not extending the SMP: %(smp)s, size: %(size)s, because'
+                     'the new size: %(new_size)s is smaller.',
                      {'smp': smp_name, 'size': smp.total_capacity_gb,
-                      'thin': smp.is_thin_lun, 'new_size': lun_size})
+                      'new_size': lun_size})
 
 
 def run_migration_taskflow(client,
