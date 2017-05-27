@@ -1,5 +1,0 @@
----
-upgrade:
-  - The XML API has been removed in Newton release.
-    Cinder supports only JSON API request/response format now.
-

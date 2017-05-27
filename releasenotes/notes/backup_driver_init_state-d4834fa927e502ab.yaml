@@ -1,3 +1,0 @@
----
-fixes:
-  - Fixed service state reporting when backup manager is unable to initialize one of the backup drivers.

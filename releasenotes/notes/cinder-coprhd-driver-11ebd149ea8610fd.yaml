@@ -1,2 +1,0 @@
-features:
-  - Added volume backend drivers for CoprHD FC, iSCSI and Scaleio.

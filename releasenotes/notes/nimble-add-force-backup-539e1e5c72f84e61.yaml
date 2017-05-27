@@ -1,3 +1,0 @@
----
-features:
-  - Support for force backup of in-use Cinder volumes in Nimble driver.

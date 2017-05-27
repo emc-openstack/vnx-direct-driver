@@ -73,10 +73,10 @@ class EMCVNXDriver(driver.TransferVD,
                 Replication v2 support(managed)
                 Configurable migration rate support
         8.0.0 - New VNX Cinder driver
-        9.0.0 - Use asynchronous migration for cloning
+        8.1.0 - Use asynchronous migration for cloning
     """
 
-    VERSION = '09.00.00'
+    VERSION = '08.01.00'
     VENDOR = 'Dell EMC'
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "EMC_VNX_CI"

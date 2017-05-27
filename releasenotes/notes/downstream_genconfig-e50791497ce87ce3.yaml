@@ -1,3 +1,0 @@
----
-fixes:
-  - Removed the need for deployers to run tox for config reference generation.

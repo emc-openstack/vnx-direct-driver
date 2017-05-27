@@ -1,7 +1,0 @@
-[run]
-branch = True
-source = cinder
-omit = cinder/tests/*,cinder/openstack/common/*
-
-[report]
-ignore_errors = True

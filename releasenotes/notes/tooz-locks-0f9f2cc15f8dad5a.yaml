@@ -1,4 +1,0 @@
----
-features:
-  - Locks may use Tooz as abstraction layer now, to support distributed lock
-    managers and prepare Cinder to better support HA configurations.

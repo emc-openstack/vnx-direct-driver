@@ -1,3 +1,0 @@
----
-features:
-  - Added support for vhd and vhdx disk-formats for volume upload-to-image.

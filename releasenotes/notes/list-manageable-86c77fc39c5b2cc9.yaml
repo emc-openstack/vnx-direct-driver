@@ -1,5 +1,0 @@
----
-features:
-  - Added the ability to list manageable volumes and snapshots via GET
-    operation on the /v2/<project_id>/os-volume-manage and
-    /v2/<project_id>/os-snapshot-manage URLs, respectively.

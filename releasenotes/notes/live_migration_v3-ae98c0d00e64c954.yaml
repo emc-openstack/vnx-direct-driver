@@ -1,3 +1,0 @@
----
-fixes:
-  - Fixed live migration on EMC VMAX3 backends.

@@ -1,3 +1,0 @@
----
-upgrade:
-  - Support iSCSI configuration in replication in Huawei driver.

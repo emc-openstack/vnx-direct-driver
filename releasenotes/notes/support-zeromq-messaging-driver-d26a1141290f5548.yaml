@@ -1,3 +1,0 @@
----
-features:
-  - Added support for ZeroMQ messaging driver in cinder single backend config.

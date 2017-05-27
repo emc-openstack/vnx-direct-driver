@@ -1,4 +1,0 @@
----
-fixes:
-  - Fixed backup and restore of volumes in VMware VMDK driver.
-

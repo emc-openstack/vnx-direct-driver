@@ -1,3 +1,0 @@
----
-fixes:
-  - Corrected quota usage when transferring a volume between tenants.

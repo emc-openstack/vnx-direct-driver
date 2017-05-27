@@ -1,3 +1,0 @@
----
-features:
-  - New config option to enable discard (trim/unmap) support for any backend.

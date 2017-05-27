@@ -1,8 +1,0 @@
-{
-    "consistencygroup": {
-        "name": "firstcg",
-        "description": "first consistency group",
-        "volume_types": "type1,type2",
-        "availability_zone": "az0"
-    }
-}
