@@ -20,6 +20,7 @@ from oslo_log import log as logging
 from oslo_service import loopingcall
 from oslo_utils import excutils
 from oslo_utils import importutils
+from oslo_utils import uuidutils
 
 storops = importutils.try_import('storops')
 
@@ -233,6 +234,13 @@ def is_snapcopy_enabled(volume):
 
 
 def is_async_migrate_enabled(volume):
+    display_name = volume.display_name
+    if (display_name.startswith('image-')
+            and uuidutils.is_uuid_like(display_name[6:])):
+        LOG.debug('Volume: %s is for image cache. Use sync migration.',
+                  volume.name)
+        return False
+
     extra_specs = common.ExtraSpecs.from_volume(volume)
     if extra_specs.is_replication_enabled:
         # For replication-enabled volume, we should not use the async-cloned
