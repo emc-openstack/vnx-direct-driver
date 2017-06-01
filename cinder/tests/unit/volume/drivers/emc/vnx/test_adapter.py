@@ -13,8 +13,12 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 import mock
+import os
 import re
 
+from oslo_config import cfg
+
+from cinder import context
 from cinder import exception
 from cinder.objects import fields
 from cinder import test
@@ -38,6 +42,8 @@ class TestCommonAdapter(test.TestCase):
         vnx_utils.init_ops(self.configuration)
         self.configuration.san_ip = '192.168.1.1'
         self.configuration.storage_vnx_authentication_type = 'global'
+        self.configuration.config_group = 'vnx_backend'
+        self.ctxt = context.get_admin_context()
 
     def tearDown(self):
         super(TestCommonAdapter, self).tearDown()
@@ -1057,6 +1063,15 @@ class TestCommonAdapter(test.TestCase):
         self.assertEqual(mocked_input['new_volume'].provider_location,
                          data['provider_location'])
         self.assertEqual('True', data['metadata']['snapcopy'])
+
+    @res_mock.patch_common_adapter
+    def test_normalize_config_queue_path(self, common_adapter,
+                                         mocked_res):
+        common_adapter._normalize_config()
+        self.assertEqual(os.path.join(cfg.CONF.state_path,
+                                      'vnx',
+                                      'vnx_backend'),
+                         common_adapter.queue_path)
 
     @res_mock.patch_common_adapter
     def test_normalize_config_naviseccli_path(self, common_adapter,
