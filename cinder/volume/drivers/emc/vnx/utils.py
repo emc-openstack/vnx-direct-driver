@@ -234,13 +234,6 @@ def is_snapcopy_enabled(volume):
 
 
 def is_async_migrate_enabled(volume):
-    display_name = volume.display_name
-    if (display_name.startswith('image-')
-            and uuidutils.is_uuid_like(display_name[6:])):
-        LOG.debug('Volume: %s is for image cache. Use sync migration.',
-                  volume.name)
-        return False
-
     extra_specs = common.ExtraSpecs.from_volume(volume)
     if extra_specs.is_replication_enabled:
         # For replication-enabled volume, we should not use the async-cloned
@@ -359,3 +352,26 @@ def truncate_fc_port_wwn(wwn):
 
 def is_volume_smp(volume):
     return 'smp' == extract_provider_location(volume.provider_location, 'type')
+
+
+def is_image_cache_volume(volume):
+    display_name = volume.display_name
+    if (display_name.startswith('image-')
+            and uuidutils.is_uuid_like(display_name[6:])):
+        LOG.debug('Volume: %s is for image cache. Use sync migration and '
+                  'thin provisioning.', volume.name)
+        return True
+    return False
+
+
+def calc_migrate_and_provision(volume):
+    """Returns a tuple of async migrate and provision type.
+
+    The first element is the flag whether to enable async migrate,
+    the second is the provision type (thin or thick).
+    """
+    if is_image_cache_volume(volume):
+        return False, storops.VNXProvisionEnum.THIN
+    else:
+        specs = common.ExtraSpecs.from_volume(volume)
+        return is_async_migrate_enabled(volume), specs.provision

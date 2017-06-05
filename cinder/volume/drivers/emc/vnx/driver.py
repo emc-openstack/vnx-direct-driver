@@ -76,9 +76,11 @@ class EMCVNXDriver(driver.TransferVD,
         8.1.0 - Use asynchronous migration for cloning
         8.1.1 - Cherry pick `permission deny` fix,
                 https://review.openstack.org/#/c/462894
+        8.1.2 - Extend SMP size before aync migration when cloning from an
+                image cache volume
     """
 
-    VERSION = '08.01.01'
+    VERSION = '08.01.02'
     VENDOR = 'Dell EMC'
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "EMC_VNX_CI"
