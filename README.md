@@ -1,5 +1,11 @@
 # DELL EMC VNX Driver for Newton
 
+## Versions
+|       | Liberty | Mitaka | Newton | Ocata | Pike   |
+|-------|---------|--------|--------|-------|--------|
+| Unity | 0.3.x   | 0.4.x  | 0.5.x  | 1.x.x | 2.x.x  |
+| VNX   | 6.x.x   | 7.x.x  | 8.x.x  | 9.x.x | 10.x.x |
+
 ## License
     Copyright (c) 2016 EMC Corporation, Inc.
     All Rights Reserved.
