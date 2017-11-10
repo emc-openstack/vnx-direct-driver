@@ -16,6 +16,8 @@ from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import importutils
 
+import time
+
 storops = importutils.try_import('storops')
 if storops:
     from storops import exception as storops_ex
@@ -221,7 +223,8 @@ class Client(object):
         :returns Boolean: True or False
         """
         src_lun = self.vnx.get_lun(lun_id=src_id)
-
+        # Sleep 30 seconds to make sure the session starts On the VNX.
+        time.sleep(30)
         utils.wait_until(condition=self.session_finished,
                          interval=common.INTERVAL_30_SEC,
                          src_lun=src_lun)

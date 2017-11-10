@@ -144,26 +144,31 @@ class TestClient(test.TestCase):
                           dst_id=5)
         lun.migrate.assert_called_with(5, storops.VNXMigrationRate.HIGH)
 
+    @utils.patch_sleep
     @res_mock.patch_client
-    def test_verify_migration(self, client, mocked):
+    def test_verify_migration(self, client, mocked, sleep_mock):
         r = client.verify_migration(1, 2, 'test_wwn')
         self.assertTrue(r)
 
+    @utils.patch_sleep
     @res_mock.patch_client
-    def test_verify_migration_false(self, client, mocked):
+    def test_verify_migration_false(self, client, mocked, sleep_mock):
         r = client.verify_migration(1, 2, 'fake_wwn')
         self.assertFalse(r)
 
+    @utils.patch_sleep
     @res_mock.patch_client
-    def test_cleanup_migration(self, client, mocked):
+    def test_cleanup_migration(self, client, mocked, sleep_mock):
         client.cleanup_migration(1, 2)
 
     @res_mock.patch_client
     def test_cleanup_migration_not_migrating(self, client, mocked):
         client.cleanup_migration(1, 2)
 
+    @utils.patch_sleep
     @res_mock.patch_client
-    def test_cleanup_migration_cancel_failed(self, client, mocked):
+    def test_cleanup_migration_cancel_failed(self, client, mocked,
+                                             sleep_mock):
         client.cleanup_migration(1, 2)
 
     @res_mock.patch_client

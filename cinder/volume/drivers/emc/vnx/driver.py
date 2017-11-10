@@ -80,9 +80,10 @@ class EMCVNXDriver(driver.TransferVD,
                 image cache volume
         8.1.3 - Cherry pick `wrong size of volume from image cache` fix from
                 Pike, https://review.openstack.org/#/c/476402/
+        8.1.4 - Fix occasional failure for cloning volume
     """
 
-    VERSION = '08.01.03'
+    VERSION = '08.01.04'
     VENDOR = 'Dell EMC'
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "EMC_VNX_CI"
