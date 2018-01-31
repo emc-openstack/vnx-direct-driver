@@ -85,9 +85,12 @@ class EMCVNXDriver(driver.TransferVD,
                 Newton, https://review.openstack.org/#/c/501370/
         8.1.6 - Fix perf issue when create/delete volume, cherry-picked from
                 upstream, https://review.openstack.org/#/c/557156
+        8.1.7 - Fix osbrick exception when `initiator_target_map` is None,
+                cherry-picked from upstream,
+                https://review.openstack.org/#/c/539445/
     """
 
-    VERSION = '08.01.06'
+    VERSION = '08.01.07'
     VENDOR = 'Dell EMC'
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "EMC_VNX_CI"
