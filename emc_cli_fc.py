@@ -62,6 +62,7 @@ class EMCCLIFCDriver(driver.FibreChannelDriver):
                 Replication v2 support(managed)
                 Configurable migration rate support
         7.1.0 - Asynchronous migration support
+        7.1.1 - Bugfix: KeyError raised if remove_export_snapshot invoked
     """
 
     def __init__(self, *args, **kwargs):
