@@ -83,9 +83,11 @@ class EMCVNXDriver(driver.TransferVD,
         8.1.4 - Fix occasional failure for cloning volume
         8.1.5 - Fix issue when backing-up in-use volume, cherry-picked from
                 Newton, https://review.openstack.org/#/c/501370/
+        8.1.6 - Fix perf issue when create/delete volume, cherry-picked from
+                upstream, https://review.openstack.org/#/c/557156
     """
 
-    VERSION = '08.01.05'
+    VERSION = '08.01.06'
     VENDOR = 'Dell EMC'
     # ThirdPartySystems wiki page
     CI_WIKI_NAME = "EMC_VNX_CI"
